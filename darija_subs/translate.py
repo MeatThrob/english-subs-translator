@@ -48,7 +48,19 @@ def _quiet_tokenizer_noise():
         def filter(self, record: logging.LogRecord) -> bool:
             return "incorrect regex pattern" not in record.getMessage()
 
-    logging.getLogger("transformers").addFilter(_Drop())
+    drop = _Drop()
+    root = logging.getLogger("transformers")
+    root.addFilter(drop)
+    # A logger's filters run only for records emitted through THAT logger;
+    # a parent's filters are skipped for its children's records (only the
+    # parent's handlers are reached). The note comes from the child logger
+    # transformers.tokenization_utils_base, so filtering the parent alone
+    # does nothing — the filter has to sit on the handler every child's
+    # record passes through.
+    from transformers.utils import logging as _hf_logging
+    _hf_logging.get_logger()          # force the library handler to exist
+    for handler in root.handlers:
+        handler.addFilter(drop)
 
 
 def cache_path_for(cache_dir: str, model_dir: str, target_lang: str) -> str:
