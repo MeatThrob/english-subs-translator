@@ -161,12 +161,38 @@ Routing lives in `darija_subs/langs.py` (`SPECIALIST_MODELS`); drop in
 another specialist (e.g. a gated Terjman-Large after `huggingface-cli
 login`) and map its language there.
 
+## Other platforms
+
+**Windows — experimental, in [`windows/`](windows/).** A Qt/PySide6 port
+(WinRT OCR, `mss` capture, `WDA_EXCLUDEFROMCAPTURE` for
+capture-exclusion). Its platform-independent parts — pipeline, GUI,
+translation — are verified end-to-end on macOS (e2e PASS, GUI self-test
+PASS, Darija output char-identical to this repo's 46-line golden), but
+**it has never been executed on a real Windows machine**: the WinRT OCR
+backend, the capture-exclusion call, the DPI scaling and the `.bat`
+scripts are all unexercised. It is also **Darija-only** — it predates
+the multilingual work and does not yet have the 202-language support
+above. `windows/README.md` states exactly what is unverified and ships
+self-tests so the first Windows user can find out in ~2 minutes;
+results reported in an issue are genuinely welcome.
+
+**Linux — not supported yet.** No port exists, and honesty about the
+delta: OCR would be easy (the Windows port's RapidOCR backend is
+cross-platform), but under Wayland three things this app depends on are
+restricted or impossible — `mss` cannot capture other windows (needs
+xdg-desktop-portal/PipeWire), a client cannot place an always-on-top
+overlay at absolute screen coordinates (needs layer-shell, which GNOME
+does not support), and there is no capture-exclusion equivalent at all.
+An X11-only port would be a modest job; a Wayland one is a real project.
+Neither exists today.
+
 ## Licensing
 
 **The MIT license in this repo covers the code only — not the model
 weights.** No weights are redistributed here; `tools/setup_model.sh`
-downloads them from Hugging Face onto your machine at setup time, and
-what you may do with them is governed by their own licenses:
+(macOS) and `windows/setup.bat` (Windows) download them from Hugging
+Face onto your machine at setup time, and what you may do with them is
+governed by their own licenses:
 
 - `facebook/nllb-200-distilled-600M` — **CC-BY-NC-4.0
   (non-commercial)**.
