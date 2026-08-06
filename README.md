@@ -1,6 +1,12 @@
 # darija-subs
 
-Live English-subtitle → **any of 202 languages** overlay for macOS.
+Live English-subtitle → **any of 202 languages** overlay, for
+**macOS and Windows**. macOS is the verified daily driver; the Windows
+port lives in [`windows/`](windows/) and is **experimental — it has
+never been executed on real Windows hardware** (its platform-independent
+core is verified on macOS; see [`windows/README.md`](windows/README.md)
+for exactly what is and is not tested). Linux is not supported.
+
 The name is the origin story: it began as a Moroccan Arabic (Darija)
 tool, and Darija is still the default target with its own specialist
 model — but it now translates into any NLLB-200 language. Point it at
@@ -28,6 +34,10 @@ Turkish, Hindi, Bengali, Urdu, Tamil, Japanese, Korean, Chinese
 Swahili, and 170+ more, each labelled with its native name in the picker.
 
 ## How it works
+
+(The mechanisms below name the macOS implementations; the Windows port
+swaps in `mss` capture, WinRT OCR and a Qt overlay for the same four
+steps — see `windows/README.md`.)
 
 1. **Capture** — grabs the screen region you selected (~10x/sec, Quartz).
    Works over any player because it reads pixels, not the app.
@@ -68,7 +78,10 @@ lag on an NLLB language. End-to-end (fake player, Darija): show avg
 ~190–300 ms, hide ~100–130 ms, cache hits ~90 ms. Spanish/NLLB:
 show avg ~735 ms.
 
-## Usage
+## Usage (macOS)
+
+(Windows: same features via `windows\gui.bat` / `windows\run.bat` —
+setup and usage in [`windows/README.md`](windows/README.md).)
 
 **Control panel** (recommended — has the language picker):
 
@@ -122,7 +135,10 @@ Options:
 | `--model DIR` | force a specific model dir (overrides per-language routing) |
 | `--headless --log f.jsonl` | no overlay; just log events (testing) |
 
-## Setup from a clean clone
+## Setup from a clean clone (macOS)
+
+(Windows setup: run `windows\setup.bat` — see
+[`windows/README.md`](windows/README.md).)
 
 Models and the venv are **not** in the repo (≈715 MB, rebuildable):
 
