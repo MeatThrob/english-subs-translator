@@ -1,0 +1,8 @@
+ctranslate2>=4.0
+transformers>=4.40,<5
+sentencepiece
+numpy
+mss
+pillow
+PySide6>=6.6
+winsdk; sys_platform == 'win32'
