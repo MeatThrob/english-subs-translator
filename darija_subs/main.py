@@ -44,6 +44,36 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
+def saved_region(cfg: dict) -> tuple[float, float, float, float] | None:
+    """The capture region saved in config.json, if it is usable now.
+
+    This is what makes `run.sh --pick` stick: the picked box is saved,
+    and both the CLI and the control panel call this before falling back
+    to the lower-half auto-scan. Returns None for a missing/malformed
+    region or one that no longer overlaps any active display (e.g. the
+    monitor it was picked on is unplugged) — silently capturing an
+    off-screen rect would fail with a misleading permission hint.
+    """
+    reg = cfg.get("region")
+    try:
+        x, y, w, h = (float(v) for v in reg)
+    except (TypeError, ValueError):
+        return None
+    if w < 50 or h < 20:
+        return None
+    import Quartz
+    err, ids, _ = Quartz.CGGetActiveDisplayList(16, None, None)
+    if not err and ids:
+        for did in ids:
+            b = Quartz.CGDisplayBounds(did)
+            if (x < b.origin.x + b.size.width and x + w > b.origin.x
+                    and y < b.origin.y + b.size.height
+                    and y + h > b.origin.y):
+                return (x, y, w, h)
+        return None
+    return (x, y, w, h)  # display list unavailable: assume usable
+
+
 class EventLog:
     def __init__(self, path: str | None, echo: bool = True, listener=None):
         self.path = path
@@ -182,9 +212,10 @@ def parse_args(argv):
     p.add_argument("--pick", action="store_true",
                    help="manually drag-select a region instead of the "
                         "automatic lower-half scan")
-    p.add_argument("--band", type=float, default=0.5,
+    p.add_argument("--band", type=float, default=None,
                    help="auto-scan band: fraction of screen height where the "
-                        "scan starts (default 0.5 = lower half)")
+                        "scan starts (0.5 = lower half). Passing it "
+                        "explicitly overrides a saved/picked region")
     p.add_argument("--region", type=str, help="x,y,w,h in global screen points (top-left origin)")
     p.add_argument("--position", choices=["above", "below", "cover"], default=None,
                    help="where the translation goes relative to the English "
@@ -286,15 +317,20 @@ def main(argv=None):
         )
         return 3
 
+    # Region precedence: --region > --pick > explicit --band >
+    # saved/picked region from config.json > lower-half auto-scan.
     region = None
     if args.region:
         region = tuple(float(v) for v in args.region.split(","))
     elif not args.pick:
-        import Quartz
-        b = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-        top = b.size.height * args.band
-        region = (b.origin.x, b.origin.y + top,
-                  b.size.width, b.size.height - top)
+        if args.band is None:
+            region = saved_region(cfg)
+        if region is None:
+            import Quartz
+            b = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+            top = b.size.height * (0.5 if args.band is None else args.band)
+            region = (b.origin.x, b.origin.y + top,
+                      b.size.width, b.size.height - top)
 
     log = EventLog(args.log, echo=not args.quiet)
 

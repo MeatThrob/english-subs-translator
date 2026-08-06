@@ -28,7 +28,8 @@ from PyObjCTools import AppHelper
 
 from . import langs
 from .main import (CACHE_DIR, CONFIG_PATH, MODELS_DIR, EventLog, Pipeline,
-                   finalize_args, load_config, parse_args, save_config)
+                   finalize_args, load_config, parse_args, save_config,
+                   saved_region)
 from .overlay import Overlay
 from .translate import Translator
 
@@ -579,11 +580,19 @@ class Controller(AppKit.NSObject):
         else:
             self._set_status("Watching for subtitles", ACCENT_ON)
             self.button.configure("On", ACCENT_ON)
-            self.hint.setStringValue_("Scanning the lower part of the screen")
+            self.hint.setStringValue_(
+                "Scanning your saved subtitle region"
+                if saved_region(self.cfg) is not None
+                else "Scanning the lower part of the screen")
 
     # ---------- pipeline -----------------------------------------
     @objc.python_method
     def _region(self):
+        """Same precedence as run.sh: a saved/picked region from
+        config.json wins; lower half of the main display otherwise."""
+        reg = saved_region(self.cfg)
+        if reg is not None:
+            return reg
         b = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
         top = b.size.height * 0.5
         return (b.origin.x, b.origin.y + top,
