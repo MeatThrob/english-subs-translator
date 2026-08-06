@@ -1,0 +1,16 @@
+# Rebuildable/local-only — a clean clone + tools/setup_model.sh restores everything.
+.venv/
+models/
+__pycache__/
+*.pyc
+
+# Runtime data (translated lines, per-machine settings)
+cache.json
+cache.json.tmp
+cache/
+config.json
+*.jsonl
+*.log
+
+# macOS
+.DS_Store
