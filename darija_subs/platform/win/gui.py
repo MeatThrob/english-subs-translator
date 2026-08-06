@@ -1,36 +1,44 @@
 """Subtitle Translator — desktop control panel (Qt/PySide6).
 
-One big On/Off control, the subtitle text size, and a colour wheel with
-a hex bar. The translation model loads once at launch and is reused, so
-toggling On is instant.
+Feature parity with the macOS AppKit panel: one big On/Off control, a
+searchable target-language picker (all 202 NLLB-200 languages, recents
+on top, native names shown), the subtitle text size, and a colour wheel
+with a hex bar. The translation model loads once at launch and is
+reused, so toggling On is instant. Changing language reuses the
+already-loaded NLLB model via retarget() — only crossing the
+Terjman/NLLB boundary loads weights — and switching while the overlay
+is running auto-stops, swaps, and auto-restarts.
 
 On Windows the panel excludes itself from screen capture (the same
 WDA_EXCLUDEFROMCAPTURE the overlay uses), so the OCR can never read the
 panel's own text as if it were subtitles.
 
-Run:  gui.bat        (or: .venv\\Scripts\\python -m darija_subs.gui_qt)
+Run:  windows\\gui.bat   (or: .venv\\Scripts\\python -m darija_subs.gui)
 """
 
 import colorsys
 import math
-import os
 import sys
 import threading
 import time
 
-import numpy as np
 from PySide6.QtCore import Qt, QObject, Signal
-from PySide6.QtGui import QFont, QImage, QPainter, QPen, QColor
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSlider, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import QImage, QPainter, QPen, QColor
+from PySide6.QtWidgets import (QApplication, QComboBox, QCompleter, QFrame,
+                               QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                               QSlider, QVBoxLayout, QWidget)
 
-from .main import (CONFIG_PATH, DEFAULT_CACHE, EventLog, Pipeline,
-                   load_config, parse_args, save_config)
-from .overlay_qt import Overlay, _exclude_from_capture
-from .translate import Translator
+from ... import langs
+from ...gui_common import (config_snapshot as _config_snapshot, hex_to_rgb,
+                           rgb_to_hex, wheel_rgb_at, wheel_rgba)
+from ...main import finalize_args, parse_args
+from ...pipeline import (CACHE_DIR, MODELS_DIR, EventLog, Pipeline,
+                         load_config, save_config, saved_region)
+from ...translate import Translator
+from . import Backend
+from .overlay import Overlay, _exclude_from_capture
 
-W, H = 460, 566
+W, H = 460, 622
 WHEEL = 168
 
 GREEN, GREEN_HI = "#29b85c", "#2fc866"
@@ -57,6 +65,16 @@ QFrame#card {
 }
 QFrame#swatch { border: 1px solid rgba(255,255,255,0.25); border-radius: 6px; }
 
+QComboBox#lang {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 6px; color: #e8eaed; padding: 3px 8px; font-size: 12px;
+}
+QComboBox#lang QAbstractItemView {
+    background: #24262b; color: #e8eaed;
+    selection-background-color: #3b7ddd;
+}
+
 QLineEdit#hex {
     background: rgba(255,255,255,0.08);
     border: 1px solid rgba(255,255,255,0.14);
@@ -82,38 +100,6 @@ QSlider::handle:horizontal {
     margin: -6px 0; border-radius: 7px;
 }
 """
-
-
-def hex_to_rgb(s):
-    h = (s or "").strip().lstrip("#")
-    if len(h) == 3:
-        h = "".join(c * 2 for c in h)
-    if len(h) != 6:
-        return None
-    try:
-        return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
-    except ValueError:
-        return None
-
-
-def rgb_to_hex(rgb):
-    return "#%02X%02X%02X" % tuple(
-        max(0, min(255, int(round(c * 255)))) for c in rgb)
-
-
-def wheel_rgb_at(size, x, y, y_down=True):
-    """Pure geometry: which colour lives at (x, y) on a `size` disc.
-    Points outside the disc clamp to the rim."""
-    c = size / 2.0
-    dx = (x - c) / c
-    dy = (y - c) / c
-    if y_down:
-        dy = -dy
-    r = math.hypot(dx, dy)
-    if r > 1.0:
-        dx, dy, r = dx / r, dy / r, 1.0
-    h = (math.degrees(math.atan2(dy, dx)) % 360.0) / 360.0
-    return colorsys.hsv_to_rgb(h, min(1.0, r), 1.0)
 
 
 def _power_css(color, hover):
@@ -147,41 +133,11 @@ class ColorWheel(QWidget):
         self.setFixedSize(size, size)
         self._size = size
         self._rgb = (1.0, 1.0, 1.0)
-        self._buf, self._img = self._render(size)
+        rgba = wheel_rgba(size)
+        self._buf = rgba.tobytes()   # keep alive: QImage does not copy
+        self._img = QImage(self._buf, size, size, size * 4,
+                           QImage.Format.Format_RGBA8888_Premultiplied)
         self.setCursor(Qt.CrossCursor)
-
-    @staticmethod
-    def _render(size):
-        yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
-        c = (size - 1) / 2.0
-        dx = (xx - c) / c
-        dy = (yy - c) / c
-        r = np.sqrt(dx * dx + dy * dy)
-        h = (np.degrees(np.arctan2(-dy, dx)) % 360.0) / 360.0
-        s = np.clip(r, 0.0, 1.0)
-        v = np.ones_like(s)
-
-        i = np.floor(h * 6.0)
-        f = h * 6.0 - i
-        p = v * (1.0 - s)
-        q = v * (1.0 - f * s)
-        t = v * (1.0 - (1.0 - f) * s)
-        conds = [(i % 6).astype(int) == k for k in range(6)]
-        rr = np.select(conds, [v, q, p, p, t, v])
-        gg = np.select(conds, [t, v, v, q, p, p])
-        bb = np.select(conds, [p, p, t, v, v, q])
-
-        edge = np.clip((1.0 - r) * c, 0.0, 1.0)
-        a = np.where(r <= 1.0, edge, 0.0)
-        rgba = np.zeros((size, size, 4), dtype=np.uint8)
-        rgba[..., 0] = (rr * a * 255).astype(np.uint8)
-        rgba[..., 1] = (gg * a * 255).astype(np.uint8)
-        rgba[..., 2] = (bb * a * 255).astype(np.uint8)
-        rgba[..., 3] = (a * 255).astype(np.uint8)
-        buf = rgba.tobytes()   # keep alive: QImage does not copy
-        img = QImage(buf, size, size, size * 4,
-                     QImage.Format.Format_RGBA8888_Premultiplied)
-        return buf, img
 
     def set_rgb(self, rgb):
         self._rgb = rgb
@@ -219,14 +175,22 @@ class ColorWheel(QWidget):
 
 
 class Events(QObject):
-    """Marshals worker-thread work onto the Qt main thread."""
+    """Marshals worker-thread work onto the Qt main thread; also the
+    pipeline's ui bridge (show/hide hop through queued signals)."""
     event = Signal(object)
-    model_ready = Signal(object)
+    model_ready = Signal(str, object, bool)   # model_dir, translator, restart
     model_failed = Signal(str)
     show_sig = Signal(str, object)
     hide_sig = Signal()
     toggle_sig = Signal()
     color_sig = Signal(str)
+    lang_sig = Signal(str)
+
+    def show(self, text, anchor=None):
+        self.show_sig.emit(text, anchor)
+
+    def hide(self):
+        self.hide_sig.emit()
 
 
 class Panel(QWidget):
@@ -234,7 +198,9 @@ class Panel(QWidget):
         super().__init__()
         self.args = args
         self.cfg = load_config()
+        self.lang = args.lang
         self.translator = None
+        self.translators = {}      # model_dir -> Translator (kept loaded)
         self.pipe = None
         self.overlay = None
         self.count = 0
@@ -247,10 +213,11 @@ class Panel(QWidget):
         self.ev.model_failed.connect(self._model_failed)
         self.ev.toggle_sig.connect(self.toggle)
         self.ev.color_sig.connect(self.apply_color)
+        self.ev.lang_sig.connect(self._lang_entered)
 
         self._build()
         self.apply_color(self.color_hex, save=False)
-        self._load_model_async()
+        self._load_model_async(restart=False)
 
     # ---------- ui ------------------------------------------------
     def _build(self):
@@ -264,12 +231,15 @@ class Panel(QWidget):
         root.setSpacing(0)
 
         for text, name in (("Subtitle Translator", "title"),
-                           ("English  →  Moroccan Darija", "subtitle"),
+                           (f"English  →  {langs.english_name(self.lang)}",
+                            "subtitle"),
                            ("Runs entirely on this PC · nothing is uploaded",
                             "privacy")):
             lb = QLabel(text)
             lb.setObjectName(name)
             lb.setAlignment(Qt.AlignCenter)
+            if name == "subtitle":
+                self.pair_label = lb
             root.addWidget(lb)
             root.addSpacing(4 if name == "title" else 3)
         root.addSpacing(16)
@@ -306,6 +276,33 @@ class Panel(QWidget):
         self.hint.setObjectName("hint")
         self.hint.setAlignment(Qt.AlignCenter)
         root.addWidget(self.hint)
+        root.addSpacing(14)
+
+        # ---- language card (type to search all 202 languages)
+        lcard = QFrame()
+        lcard.setObjectName("card")
+        lc = QHBoxLayout(lcard)
+        lc.setContentsMargins(16, 12, 16, 12)
+        ll = QLabel("Language")
+        ll.setObjectName("setlabel")
+        ll.setFixedWidth(84)
+        lc.addWidget(ll)
+        combo = QComboBox()
+        combo.setObjectName("lang")
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.setMaxVisibleItems(14)
+        combo.addItems(self._combo_items())
+        comp = combo.completer()
+        comp.setCompletionMode(QCompleter.PopupCompletion)
+        comp.setFilterMode(Qt.MatchContains)          # substring search
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        combo.setCurrentText(langs.label(self.lang))
+        combo.activated.connect(self._lang_widget_changed)
+        combo.lineEdit().returnPressed.connect(self._lang_widget_changed)
+        self.lang_combo = combo
+        lc.addWidget(combo, 1)
+        root.addWidget(lcard)
         root.addSpacing(14)
 
         # ---- style card
@@ -401,25 +398,95 @@ class Panel(QWidget):
         self.cfg["font_size"] = float(v)
         save_config(self.cfg)
 
+    # ---------- language ------------------------------------------
+    def _combo_items(self) -> list:
+        """Recently-used languages first (current one on top), then the
+        full alphabetical list — so switching back to a usual language
+        is one dropdown click, not a 202-entry scroll."""
+        recents = [c for c in ([self.lang] + self.cfg.get("recent_langs", []))
+                   if c in langs.LANGS]
+        seen: list[str] = []
+        for c in recents:
+            if c not in seen:
+                seen.append(c)
+        return [langs.label(c) for c in seen[:5]] + langs.all_labels()
+
+    def _lang_widget_changed(self, *_):
+        self._lang_entered(self.lang_combo.currentText())
+
+    def _lang_entered(self, typed: str):
+        if self.lang_combo.currentText() != typed:
+            self.lang_combo.setEditText(typed)
+        code = langs.resolve(str(typed))
+        if code is None:
+            self.lang_combo.setEditText(langs.label(self.lang))  # reject
+            return
+        if code == self.lang or self.state == "loading":
+            self.lang_combo.setEditText(langs.label(self.lang))
+            return
+        self.lang = code
+        self.args.lang = code
+        self.cfg["target_lang"] = code
+        rec = [code] + [c for c in self.cfg.get("recent_langs", [])
+                        if c != code]
+        self.cfg["recent_langs"] = rec[:5]
+        save_config(self.cfg)
+        self.lang_combo.blockSignals(True)
+        self.lang_combo.clear()
+        self.lang_combo.addItems(self._combo_items())
+        self.lang_combo.setCurrentText(langs.label(code))
+        self.lang_combo.blockSignals(False)
+        self.pair_label.setText(f"English  →  {langs.english_name(code)}")
+        was_on = self.state == "on"
+        if was_on:
+            self.stop()
+        self.state = "loading"
+        self.power.setText("Loading…")
+        self.power.setEnabled(False)
+        self.power.setStyleSheet(_power_css(GREY, GREY))
+        self._set_status("Loading model…", GREY)
+        self._load_model_async(restart=was_on)
+
     # ---------- model ---------------------------------------------
-    def _load_model_async(self):
+    def _model_dir(self) -> str:
+        # an explicit --model always wins; otherwise route per language
+        if getattr(self.args, "model_explicit", False):
+            return self.args.model
+        return langs.pick_model(self.lang, MODELS_DIR)
+
+    def _load_model_async(self, restart: bool):
+        """Load (or retarget) the model for self.lang off the main
+        thread. NLLB is one shared instance across all its languages, so
+        switching between two NLLB languages is a cache-file swap, not a
+        600 MB load."""
+        lang, model_dir = self.lang, self._model_dir()
+
         def work():
             try:
-                tr = Translator(
-                    self.args.model,
-                    beam_size=self.args.beam,
-                    cache_path=None if self.args.no_cache else DEFAULT_CACHE,
-                )
-                tr.warmup()
+                tr = self.translators.get(model_dir)
+                if tr is None:
+                    tr = Translator(
+                        model_dir,
+                        target_lang=lang,
+                        beam_size=self.args.beam,
+                        cache_dir=None if self.args.no_cache else CACHE_DIR,
+                    )
+                    tr.warmup()
+                else:
+                    tr.retarget(lang)
             except Exception as e:
                 self.ev.model_failed.emit(str(e))
                 return
-            self.ev.model_ready.emit(tr)
+            self.ev.model_ready.emit(model_dir, tr, restart)
         threading.Thread(target=work, daemon=True).start()
 
-    def _model_ready(self, tr):
+    def _model_ready(self, model_dir, tr, restart):
+        self.translators[model_dir] = tr
         self.translator = tr
+        self.args.model = model_dir
         self._set_state("off")
+        if restart:
+            self.start()
 
     def _model_failed(self, err):
         self._set_status("Model failed to load", RED)
@@ -445,10 +512,19 @@ class Panel(QWidget):
             self.power.setText("On")
             self.power.setEnabled(True)
             self.power.setStyleSheet(_power_css(GREEN, GREEN_HI))
-            self.hint.setText("Scanning the lower part of the screen")
+            self.hint.setText(
+                "Scanning your saved subtitle region"
+                if saved_region(self.cfg) is not None
+                else "Scanning the lower part of the screen")
 
     # ---------- pipeline ------------------------------------------
     def _region(self):
+        """Same precedence as the CLI: a saved/picked region from
+        config.json wins (with the unplugged-monitor guard); lower half
+        of the primary screen otherwise."""
+        reg = saved_region(self.cfg)
+        if reg is not None:
+            return reg, float(self.cfg.get("dpr", 1.0))
         screen = QApplication.primaryScreen()
         g = screen.geometry()
         top = int(g.height() * 0.5)
@@ -471,13 +547,14 @@ class Panel(QWidget):
 
         self.overlay = Overlay(region, position="above",
                                font_size=a.font_size,
-                               text_color=self.color_hex)
+                               text_color=self.color_hex,
+                               lang=self.lang)
         self.ev.show_sig.connect(self.overlay.show_text)
         self.ev.hide_sig.connect(self.overlay.hide_text)
 
         log = EventLog(a.log, echo=False, listener=self.ev.event.emit)
-        self.pipe = Pipeline(region, dpr, a, log, bridge=self.ev,
-                             translator=self.translator)
+        self.pipe = Pipeline(region, a, log, Backend(a, region, dpr),
+                             ui=self.ev, translator=self.translator)
         self.count = 0
         self.pipe.start()
         self._set_state("on")
@@ -511,7 +588,7 @@ class Panel(QWidget):
         elif ev == "capture_failed":
             self._set_status("Screen capture failed", RED)
         elif ev == "ocr_error":
-            self._set_status("OCR error — see README", RED)
+            self._set_status("OCR error — see windows/README.md", RED)
 
 
 def _wait(pred, timeout=20.0, step=0.2):
@@ -523,28 +600,10 @@ def _wait(pred, timeout=20.0, step=0.2):
     return False
 
 
-def _config_snapshot():
-    """Return a callable that puts config.json back byte-for-byte."""
-    try:
-        with open(CONFIG_PATH, "rb") as f:
-            data = f.read()
-    except OSError:
-        data = None
-
-    def restore():
-        if data is None:
-            if os.path.exists(CONFIG_PATH):
-                os.remove(CONFIG_PATH)
-        else:
-            with open(CONFIG_PATH, "wb") as f:
-                f.write(data)
-    return restore
-
-
 def _self_test(panel, app):
     """Drive the panel from a worker thread via queued signals only —
-    never touch a widget directly from here. Never leaves the user's
-    real config.json altered (the handlers under test save to it)."""
+    never write to a widget from here. Never leaves the user's real
+    config.json altered (the handlers under test save to it)."""
     restore = _config_snapshot()
     try:
         _run_self_test(panel, app)
@@ -562,8 +621,7 @@ def _run_self_test(panel, app):
     print(f"model loaded in {time.time()-t0:.1f}s; state={panel.state}",
           flush=True)
 
-    # wheel geometry (pure maths, no widget access): rim at 3 o'clock = red,
-    # 12 o'clock = green, centre = white
+    # wheel geometry (pure maths, no widget access)
     checks = [((WHEEL + 40, WHEEL / 2), "#FF0000", "3 o'clock"),
               ((-40, WHEEL / 2), "#00FFFF", "9 o'clock"),
               ((WHEEL / 2, WHEEL / 2), "#FFFFFF", "centre")]
@@ -628,6 +686,79 @@ def _run_self_test(panel, app):
     panel.ev.toggle_sig.emit()
     _wait(lambda: panel.pipe is None, 10)
 
+    # -- language switching, driven like a user: type a partial name
+    # into the combo and confirm (2 gestures: type + Enter) ----------
+    from ...pipeline import load_config as _reload_cfg
+
+    def switch_to(typed, want_code, want_state, timeout):
+        panel.ev.lang_sig.emit(typed)
+        t = time.time()
+        while time.time() - t < timeout:
+            if (panel.state == want_state and panel.lang == want_code
+                    and panel.translator is not None
+                    and panel.translator.target_lang == want_code
+                    and (want_state == "off"
+                         or (panel.pipe is not None
+                             and panel.pipe.is_alive()))):
+                return time.time() - t
+            time.sleep(0.3)
+        return None
+
+    def lang_check(typed, want_code, want_state, timeout, expect):
+        dt = switch_to(typed, want_code, want_state, timeout)
+        if dt is None:
+            print(f"FAIL: typing {typed!r} never reached "
+                  f"{want_code}/{want_state}", flush=True)
+            return False
+        combo_now = str(panel.lang_combo.currentText())
+        saved = _reload_cfg().get("target_lang")
+        sample = panel.translator.translate("Good morning, my friend.")
+        if combo_now != langs.label(want_code):
+            print(f"FAIL: combo shows {combo_now!r} after {typed!r}",
+                  flush=True)
+            return False
+        if saved != want_code:
+            print(f"FAIL: config target_lang={saved!r}, want {want_code}",
+                  flush=True)
+            return False
+        if not expect(sample):
+            print(f"FAIL: sample for {want_code}: {sample!r}", flush=True)
+            return False
+        print(f"lang ok — typed {typed!r} -> {langs.english_name(want_code)} "
+              f"({want_state}, {dt:.1f}s) {sample!r}", flush=True)
+        return True
+
+    latin = lambda s: bool(s) and all(ord(c) < 0x370 for c in s)
+    arab = lambda s: any("؀" <= c <= "ۿ" for c in s)
+    cyr = lambda s: any("Ѐ" <= c <= "ӿ" for c in s)
+
+    # off-state: partial English name loads NLLB
+    ok &= lang_check("spa", "spa_Latn", "off", 240, latin)
+    # informal name routes back to the terjman specialist
+    ok &= lang_check("darija", "ary_Arab", "off", 60, arab)
+
+    # realistic case: switching while the overlay is running mid-show —
+    # must auto-stop, swap model, and auto-restart without help
+    panel.ev.toggle_sig.emit()
+    if not _wait(lambda: panel.state == "on", 15):
+        print("FAIL: could not turn on before live-switch test", flush=True)
+        ok = False
+    ok &= lang_check("esp", "spa_Latn", "on", 120, latin)      # native, partial
+    ok &= lang_check("русский", "rus_Cyrl", "on", 60, cyr)     # native spelling
+    ok &= lang_check("DARIJA", "ary_Arab", "on", 60, arab)     # case-insensitive
+
+    # recents surface at the top of the dropdown, current first
+    top3 = [str(panel.lang_combo.itemText(i)) for i in range(3)]
+    want_top = [langs.label(c) for c in ("ary_Arab", "rus_Cyrl", "spa_Latn")]
+    if top3 != want_top:
+        print(f"FAIL: recents order {top3} != {want_top}", flush=True)
+        ok = False
+    else:
+        print(f"recents ok — dropdown starts {top3}", flush=True)
+
+    panel.ev.toggle_sig.emit()
+    _wait(lambda: panel.pipe is None, 10)
+
     print("PASS" if ok else "FAIL", flush=True)
     # app.quit() happens in the caller, after config restore
 
@@ -637,17 +768,29 @@ def main(argv=None):
     self_test = "--self-test" in argv
     if self_test:
         argv.remove("--self-test")
+    start_on = "--start-on" in argv
+    if start_on:
+        argv.remove("--start-on")
 
     args = parse_args(argv)
-    if not os.path.isdir(args.model):
-        print(f"ERROR: model not found at {args.model}", file=sys.stderr)
-        return 2
+    cfg = load_config()
+    args.model_explicit = args.model is not None
+    rc = finalize_args(args, cfg)
+    if rc:
+        return rc
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Subtitle Translator")
     panel = Panel(args)
     panel.show()
 
+    if start_on:
+        def _autostart():
+            if panel.translator is None:
+                threading.Timer(0.5, _autostart).start()
+            else:
+                panel.ev.toggle_sig.emit()
+        threading.Timer(0.5, _autostart).start()
     if self_test:
         threading.Thread(target=_self_test, args=(panel, app),
                          daemon=True).start()

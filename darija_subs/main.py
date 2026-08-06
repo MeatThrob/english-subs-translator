@@ -1,12 +1,16 @@
 """darija-subs: live English-subtitle -> translated overlay (200+ languages).
 
 Pipeline (all local, no network at runtime):
-  screen region capture (Quartz) -> Apple Vision OCR (English)
+  screen region capture -> on-device OCR (English)
   -> CTranslate2 int8 translation (Terjman for Darija, NLLB-200 for
      every other language) with a per-language disk cache
-  -> click-through AppKit overlay that mirrors the English show/hide.
+  -> click-through overlay that mirrors the English show/hide.
 
-Usage:
+One shared core, two platforms (auto-detected):
+  macOS   — Quartz capture, Apple Vision OCR, AppKit overlay (verified)
+  Windows — mss capture, WinRT OCR, Qt overlay (experimental)
+
+Usage (run.sh on macOS, windows\\run.bat on Windows):
   run.sh --pick            # first run: drag-select the subtitle area, then it starts
   run.sh                   # reuse saved region + language
   run.sh --lang Spanish    # translate into another language (name or NLLB code)
@@ -15,196 +19,15 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import sys
-import threading
-import time
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
-CACHE_DIR = os.path.join(PROJECT_ROOT, "cache")
-LEGACY_CACHE = os.path.join(PROJECT_ROOT, "cache.json")
-
-from . import capture, langs, ocr, subfilter, textnorm
-from .translate import Translator, migrate_legacy_cache
-
-
-def load_config() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-
-def saved_region(cfg: dict) -> tuple[float, float, float, float] | None:
-    """The capture region saved in config.json, if it is usable now.
-
-    This is what makes `run.sh --pick` stick: the picked box is saved,
-    and both the CLI and the control panel call this before falling back
-    to the lower-half auto-scan. Returns None for a missing/malformed
-    region or one that no longer overlaps any active display (e.g. the
-    monitor it was picked on is unplugged) — silently capturing an
-    off-screen rect would fail with a misleading permission hint.
-    """
-    reg = cfg.get("region")
-    try:
-        x, y, w, h = (float(v) for v in reg)
-    except (TypeError, ValueError):
-        return None
-    if w < 50 or h < 20:
-        return None
-    import Quartz
-    err, ids, _ = Quartz.CGGetActiveDisplayList(16, None, None)
-    if not err and ids:
-        for did in ids:
-            b = Quartz.CGDisplayBounds(did)
-            if (x < b.origin.x + b.size.width and x + w > b.origin.x
-                    and y < b.origin.y + b.size.height
-                    and y + h > b.origin.y):
-                return (x, y, w, h)
-        return None
-    return (x, y, w, h)  # display list unavailable: assume usable
-
-
-class EventLog:
-    def __init__(self, path: str | None, echo: bool = True, listener=None):
-        self.path = path
-        self.echo = echo
-        self.listener = listener   # called with the event dict (GUI hook)
-        self._f = open(path, "a", encoding="utf-8") if path else None
-        self._lock = threading.Lock()
-
-    def emit(self, event: str, **kw):
-        rec = {"t": time.time(), "event": event, **kw}
-        line = json.dumps(rec, ensure_ascii=False)
-        with self._lock:
-            if self._f:
-                self._f.write(line + "\n")
-                self._f.flush()
-            if self.echo:
-                print(line, flush=True)
-        if self.listener is not None:
-            try:
-                self.listener(rec)
-            except Exception:
-                pass
-
-
-class Pipeline(threading.Thread):
-    """Capture -> OCR -> translate loop. UI updates hop to the main thread."""
-
-    def __init__(self, region, args, log: EventLog, overlay=None,
-                 translator=None):
-        super().__init__(daemon=True)
-        self.region = tuple(region)
-        self.args = args
-        self.log = log
-        self.overlay = overlay
-        self.translator = translator   # preloaded model (GUI reuses it)
-        self.stop_flag = threading.Event()
-
-    def _show(self, translated: str, anchor=None):
-        if self.overlay is not None:
-            from PyObjCTools import AppHelper
-            AppHelper.callAfter(self.overlay.show_text, translated, anchor)
-
-    def _hide(self):
-        if self.overlay is not None:
-            from PyObjCTools import AppHelper
-            AppHelper.callAfter(self.overlay.hide)
-
-    def run(self):
-        a = self.args
-        translator = self.translator
-        if translator is None:
-            try:
-                translator = Translator(
-                    a.model,
-                    target_lang=a.lang,
-                    beam_size=a.beam,
-                    cache_dir=None if a.no_cache else CACHE_DIR,
-                )
-                translator.warmup()
-            except Exception as e:
-                self.log.emit("fatal", error=f"translator load failed: {e}")
-                os._exit(2)
-        self.log.emit("ready", model=a.model, lang=translator.target_lang,
-                      region=list(self.region))
-
-        committed = None
-        empty_streak = 0
-        grab_failures = 0
-        interval = a.interval / 1000.0
-
-        while not self.stop_flag.is_set():
-            t0 = time.perf_counter()
-            img = capture.grab_region(*self.region)
-            if img is None:
-                grab_failures += 1
-                if grab_failures in (1, 50):
-                    self.log.emit(
-                        "capture_failed",
-                        hint="grant Screen Recording permission and restart",
-                    )
-                time.sleep(0.5)
-                continue
-            grab_failures = 0
-
-            t1 = time.perf_counter()
-            lines = ocr.ocr_cgimage(img, fast=a.fast_ocr)
-            lines, ubox = subfilter.filter_lines(img, lines, self.region[3])
-            text = textnorm.normalize(ocr.lines_to_text(lines))
-            ocr_ms = (time.perf_counter() - t1) * 1000
-
-            anchor = None
-            if ubox is not None:
-                rx, ry, rw, rh = self.region
-                ux, uy, uw, uh = ubox
-                anchor = (
-                    rx + ux * rw,
-                    ry + (1 - uy - uh) * rh,
-                    uw * rw,
-                    uh * rh,
-                )
-
-            if len(text) > 220:
-                # not a subtitle — region is probably over the wrong thing
-                text = ""
-            if not text:
-                empty_streak += 1
-                if committed is not None and empty_streak >= a.hide_frames:
-                    committed = None
-                    self._hide()
-                    self.log.emit("hide")
-            else:
-                empty_streak = 0
-                if text != committed:
-                    t2 = time.perf_counter()
-                    translated = translator.translate(text)
-                    tr_ms = (time.perf_counter() - t2) * 1000
-                    committed = text
-                    if translated:
-                        self._show(translated, anchor)
-                        self.log.emit(
-                            "show",
-                            en=text,
-                            ar=translated,   # key kept for log/tool compat
-                            ocr_ms=round(ocr_ms, 1),
-                            tr_ms=round(tr_ms, 1),
-                        )
-
-            elapsed = time.perf_counter() - t0
-            time.sleep(max(0.0, interval - elapsed))
-
-        translator.save_cache()
+from . import langs
+from .pipeline import (CACHE_DIR, CONFIG_PATH, LEGACY_CACHE, MODELS_DIR,
+                       EventLog, Pipeline, load_config, save_config,
+                       saved_region)
+from .platform import impl as plat
+from .translate import migrate_legacy_cache
 
 
 def parse_args(argv):
@@ -216,7 +39,12 @@ def parse_args(argv):
                    help="auto-scan band: fraction of screen height where the "
                         "scan starts (0.5 = lower half). Passing it "
                         "explicitly overrides a saved/picked region")
-    p.add_argument("--region", type=str, help="x,y,w,h in global screen points (top-left origin)")
+    p.add_argument("--region", type=str,
+                   help="x,y,w,h in global screen points (top-left origin; "
+                        "logical coordinates on Windows)")
+    p.add_argument("--dpr", type=float, default=None,
+                   help="devicePixelRatio for --region (Windows scaled "
+                        "displays; default: saved or 1.0)")
     p.add_argument("--position", choices=["above", "below", "cover"], default=None,
                    help="where the translation goes relative to the English "
                         "(cover = hide the English)")
@@ -231,14 +59,18 @@ def parse_args(argv):
                         "per language — Terjman for Darija, NLLB otherwise)")
     p.add_argument("--beam", type=int, default=2,
                    help="beam size (2 = best quality/speed tradeoff, measured)")
+    p.add_argument("--ocr", default="auto",
+                   choices=["auto", "winrt", "vision", "rapid"],
+                   help="OCR engine (auto = the platform default)")
     p.add_argument("--interval", type=int, default=50, help="poll interval ms")
     p.add_argument("--hide-frames", type=int, default=2,
-                   help="consecutive empty OCR reads before hiding the Arabic")
+                   help="consecutive empty OCR reads before hiding the translation")
     p.add_argument("--turbo", action="store_true",
                    help="lowest latency: near-continuous OCR (~25ms interval) "
                         "and hide on the first empty read. Higher CPU use; "
                         "rare flicker possible on washed-out scenes")
-    p.add_argument("--fast-ocr", action="store_true", help="Vision fast mode (lower accuracy)")
+    p.add_argument("--fast-ocr", action="store_true",
+                   help="Vision fast mode (macOS only, lower accuracy)")
     p.add_argument("--headless", action="store_true", help="no overlay window; log events only")
     p.add_argument("--log", type=str, default=None, help="append JSONL events to this file")
     p.add_argument("--no-cache", action="store_true")
@@ -260,8 +92,8 @@ def resolve_language(args, cfg) -> str | None:
 
 def finalize_args(args, cfg) -> int:
     """Resolve language + model and migrate the legacy cache. Shared by
-    the CLI and the GUI so both agree on routing. Returns 0 or an error
-    exit code."""
+    the CLI and the GUIs on both platforms so all agree on routing.
+    Returns 0 or an error exit code."""
     code = resolve_language(args, cfg)
     if code is None:
         return 2
@@ -271,7 +103,7 @@ def finalize_args(args, cfg) -> int:
     if not os.path.isdir(args.model):
         print(
             f"ERROR: translation model not found at {args.model}\n"
-            f"Run: tools/setup_model.sh",
+            f"Run: {plat.SETUP_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -301,36 +133,37 @@ def main(argv=None):
     if args.position is None:
         args.position = cfg.get("position", "above")
     if args.font_size is None:
-        args.font_size = cfg.get("font_size", 46.0)
+        args.font_size = cfg.get("font_size", plat.DEFAULT_FONT_SIZE)
 
     rc = finalize_args(args, cfg)
     if rc:
         return rc
 
-    if not capture.has_screen_permission():
-        capture.request_screen_permission()
-        print(
-            "ERROR: Screen Recording permission is missing.\n"
-            "System Settings > Privacy & Security > Screen Recording ->\n"
-            "enable it for your terminal app, then rerun.",
-            file=sys.stderr,
-        )
+    err = plat.check_permission()
+    if err:
+        print(err, file=sys.stderr)
         return 3
 
-    # Region precedence: --region > --pick > explicit --band >
-    # saved/picked region from config.json > lower-half auto-scan.
+    # Region precedence (both platforms): --region > --pick > explicit
+    # --band > saved/picked region from config.json > lower-half auto-scan.
     region = None
+    dpr = args.dpr
+    region_from_config = False
     if args.region:
         region = tuple(float(v) for v in args.region.split(","))
     elif not args.pick:
         if args.band is None:
             region = saved_region(cfg)
+            if region is not None:
+                region_from_config = True
+                if dpr is None:
+                    dpr = float(cfg.get("dpr", 1.0))
         if region is None:
-            import Quartz
-            b = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-            top = b.size.height * (0.5 if args.band is None else args.band)
-            region = (b.origin.x, b.origin.y + top,
-                      b.size.width, b.size.height - top)
+            region_from_config = False
+            # macOS resolves this immediately (Quartz needs no app);
+            # Windows returns None here and the Qt glue resolves it
+            # once a QApplication exists.
+            region = plat.auto_region(0.5 if args.band is None else args.band)
 
     log = EventLog(args.log, echo=not args.quiet)
 
@@ -338,58 +171,16 @@ def main(argv=None):
         if region is None:
             print("ERROR: --headless needs --region or a saved config", file=sys.stderr)
             return 2
-        pipe = Pipeline(region, args, log, overlay=None)
-        pipe.run()  # blocking, Ctrl+C to stop
+        backend = plat.make_backend(args, region, dpr)
+        pipe = Pipeline(region, args, log, backend)
+        try:
+            pipe.run()  # blocking, Ctrl+C to stop
+        except KeyboardInterrupt:
+            pass
         return 0
 
-    # GUI path: one NSApp; optionally picker first, then overlay + worker.
-    import AppKit
-    from PyObjCTools import AppHelper
-    from .overlay import Overlay
-    from .picker import make_picker
-
-    app = AppKit.NSApplication.sharedApplication()
-    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
-
-    state = {"picker": None, "overlay": None, "pipe": None}
-
-    def start_pipeline(reg):
-        cfg["region"] = list(reg)
-        cfg["position"] = args.position
-        cfg["font_size"] = args.font_size
-        cfg["target_lang"] = args.lang
-        save_config(cfg)
-        state["overlay"] = Overlay(
-            reg, position=args.position, font_size=args.font_size,
-            lang=args.lang,
-        )
-        state["pipe"] = Pipeline(reg, args, log, overlay=state["overlay"])
-        state["pipe"].start()
-
-    def on_picked(reg):
-        w = state.pop("picker", None)
-        if w is not None:
-            w.orderOut_(None)
-        if reg is None:
-            log.emit("cancelled")
-            AppHelper.stopEventLoop()
-            return
-        log.emit("region_selected", region=list(reg))
-        start_pipeline(reg)
-
-    if args.pick or region is None:
-        state["picker"] = make_picker(on_picked)
-    else:
-        start_pipeline(region)
-
-    try:
-        AppHelper.runEventLoop(installInterrupt=True)
-    except KeyboardInterrupt:
-        pass
-    if state["pipe"] is not None:
-        state["pipe"].stop_flag.set()
-        state["pipe"].join(timeout=3)
-    return 0
+    return plat.run_gui(args, cfg, region, dpr, log,
+                        region_from_config=region_from_config)
 
 
 if __name__ == "__main__":

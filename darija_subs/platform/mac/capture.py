@@ -44,3 +44,17 @@ def grab_region(x: float, y: float, w: float, h: float):
     if img is not None and Quartz.CGImageGetWidth(img) > 1:
         return img
     return None
+
+
+def cgimage_pixels(img):
+    """Raw BGRA bytes + geometry for pixel sampling:
+    (bytes, bytes_per_row, width_px, height_px). bytes_per_row is
+    explicit because CGImage rows may be padded past width*4."""
+    prov = Quartz.CGImageGetDataProvider(img)
+    data = Quartz.CGDataProviderCopyData(prov)
+    return (
+        bytes(data),
+        Quartz.CGImageGetBytesPerRow(img),
+        Quartz.CGImageGetWidth(img),
+        Quartz.CGImageGetHeight(img),
+    )

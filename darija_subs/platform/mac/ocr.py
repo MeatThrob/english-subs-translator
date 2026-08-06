@@ -5,6 +5,7 @@ level handles stylized/outlined subtitle fonts; "fast" is ~3x quicker on
 plain text. Both are benchmarked in tests/bench_ocr.py.
 """
 
+import Quartz
 import Vision
 
 
@@ -40,6 +41,24 @@ def ocr_cgimage(cgimage, fast: bool = False, min_confidence: float = 0.3):
 
     # Vision bbox origin is bottom-left; higher y = higher on screen.
     out.sort(key=lambda t: -(t[2].origin.y + t[2].size.height))
+    return out
+
+
+def pixel_lines(cgimage, fast: bool = False, min_confidence: float = 0.3):
+    """OCR a CGImage and return lines with boxes converted from
+    Vision-normalized (origin bottom-left) to image pixels (origin
+    top-left) — the platform-neutral form the shared subfilter uses.
+    Sorted top-to-bottom (same order ocr_cgimage returns)."""
+    iw = Quartz.CGImageGetWidth(cgimage)
+    ih = Quartz.CGImageGetHeight(cgimage)
+    out = []
+    for text, conf, box in ocr_cgimage(cgimage, fast, min_confidence):
+        out.append((text, conf, (
+            box.origin.x * iw,
+            (1 - box.origin.y - box.size.height) * ih,
+            box.size.width * iw,
+            box.size.height * ih,
+        )))
     return out
 
 

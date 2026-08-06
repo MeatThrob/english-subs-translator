@@ -6,11 +6,11 @@ Run: .venv\\Scripts\\python tests\\bench_translate.py
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from darija_subs.translate import Translator, bench
 
-MODEL = os.path.join(os.path.dirname(__file__), "..", "models",
+MODEL = os.path.join(os.path.dirname(__file__), "..", "..", "models",
                      "terjman-nano-int8")
 
 SAMPLES = [

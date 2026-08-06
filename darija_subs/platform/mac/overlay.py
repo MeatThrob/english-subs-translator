@@ -20,7 +20,7 @@ jitter. All methods must be called on the main thread
 import AppKit
 import Foundation
 
-from . import langs
+from ... import langs
 
 # NSWindowCollectionBehavior flags
 _CAN_JOIN_ALL_SPACES = 1 << 0

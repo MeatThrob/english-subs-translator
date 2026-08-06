@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from PIL import Image, ImageDraw, ImageFont
 import Quartz
 
-from darija_subs.ocr import ocr_cgimage, lines_to_text
+from darija_subs.platform.mac.ocr import ocr_cgimage, lines_to_text
 from darija_subs.textnorm import normalize
 
 LINES = [

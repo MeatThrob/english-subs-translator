@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 if sys.platform != "win32":
     print("SKIP: Windows-only test")
@@ -25,9 +25,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
-from darija_subs.capture import Capture
-from darija_subs.ocr import get_backend, lines_to_text
-from darija_subs.overlay_qt import _exclude_from_capture
+from darija_subs.platform.win.capture import Capture
+from darija_subs.platform.win.ocr import get_backend, lines_to_text
+from darija_subs.platform.win.overlay import _exclude_from_capture
 
 SENTENCE = "EXCLUSION TEST SENTENCE"
 COVER = "COVER WINDOW TEXT"

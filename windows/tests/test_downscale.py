@@ -13,9 +13,9 @@ Run: .venv\\Scripts\\python tests\\test_downscale.py   (or bin/python)
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from darija_subs.ocr import downscale_bgra
+from darija_subs.platform.win.ocr import downscale_bgra
 
 FAILS = []
 

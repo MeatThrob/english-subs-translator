@@ -13,9 +13,10 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from darija_subs.ocr import get_backend, lines_to_text
+from darija_subs.platform.win.ocr import get_backend, lines_to_text
 from darija_subs.textnorm import normalize
 from frames import LINES, make_frame
 

@@ -12,14 +12,20 @@ import subprocess
 import sys
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
-PY = os.path.join(
-    ROOT, ".venv", "Scripts" if os.name == "nt" else "bin",
-    "python.exe" if os.name == "nt" else "python",
-)
-if not os.path.exists(PY):
-    PY = sys.executable
+if sys.prefix != sys.base_prefix:
+    PY = sys.executable          # already inside a venv: keep using it
+else:
+    PY = os.path.join(
+        ROOT, ".venv", "Scripts" if os.name == "nt" else "bin",
+        "python.exe" if os.name == "nt" else "python",
+    )
+    if not os.path.exists(PY):
+        PY = sys.executable
+
+# Exercise the Windows/Qt platform stack even when validating on macOS.
+ENV = {**os.environ, "DARIJA_SUBS_PLATFORM": "win"}
 
 MAX_SHOW_LATENCY = 2.0
 MAX_HIDE_LATENCY = 1.2
@@ -85,14 +91,17 @@ def _run():
     print(f"screen {sw}x{sh} dpr={dpr} -> test region {RECT}")
 
     player = subprocess.Popen(
-        [PY, os.path.join(ROOT, "tests", "fake_player.py"),
-         "--rect", RECT, "--log", PLAYER_LOG, "--trigger", TRIGGER])
+        [PY, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "fake_player.py"),
+         "--rect", RECT, "--log", PLAYER_LOG, "--trigger", TRIGGER],
+        env=ENV)
     time.sleep(2)
 
     extra = [a for a in os.environ.get("E2E_EXTRA", "").split() if a]
     app = subprocess.Popen(
         [PY, "-m", "darija_subs.main", "--region", RECT, "--dpr", str(dpr),
-         "--log", APP_LOG, "--quiet", "--no-cache"] + extra, cwd=ROOT)
+         "--log", APP_LOG, "--quiet", "--no-cache"] + extra,
+        cwd=ROOT, env=ENV)
 
     t0 = time.time()
     ready = False

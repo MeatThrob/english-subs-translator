@@ -22,7 +22,11 @@ def normalize(text: str) -> str:
     text = text.strip().strip(_MUSIC).strip()
     # collapse whitespace
     text = re.sub(r"\s+", " ", text)
-    # never feed our own Arabic overlay back in as source text
+    # never feed our own Arabic overlay back in as source text \u2014 the
+    # overlay's capture-exclusion (NSWindowSharingNone on macOS,
+    # WDA_EXCLUDEFROMCAPTURE on Windows) should make this unreachable,
+    # but the Windows call is per-machine (windows/tests/test_exclusion.py),
+    # so keep the software guard too
     if re.search(r"[\u0600-\u06FF]", text):
         return ""
     # drop pure-junk reads: need a real word (3+ consecutive letters)
