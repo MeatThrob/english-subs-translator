@@ -1,18 +1,26 @@
-"""Always-on-top, click-through Arabic subtitle overlay (AppKit).
+"""Always-on-top, click-through translated-subtitle overlay (AppKit).
 
 Properties that make it behave:
   - NSWindowSharingNone     -> invisible to screen capture (no OCR feedback loop)
   - ScreenSaver window level + FullScreenAuxiliary -> shows over fullscreen video
   - ignoresMouseEvents      -> clicks pass through to the player underneath
-  - AppKit native text      -> correct Arabic shaping + RTL for free
+  - AppKit native text      -> correct shaping for any script (Arabic
+    ligatures, CJK, Indic) and per-language RTL/LTR direction
 
-The Arabic anchors dynamically to the detected English text (an anchor
-rect in CG top-left coords), with light smoothing so it doesn't jitter.
-All methods must be called on the main thread (AppHelper.callAfter).
+The target language decides paragraph direction (RTL for Arabic/Hebrew
+scripts) and the font (SF Arabic for Arabic script; the system font
+cascades correctly for everything else).
+
+The translation anchors dynamically to the detected English text (an
+anchor rect in CG top-left coords), with light smoothing so it doesn't
+jitter. All methods must be called on the main thread
+(AppHelper.callAfter).
 """
 
 import AppKit
 import Foundation
+
+from . import langs
 
 # NSWindowCollectionBehavior flags
 _CAN_JOIN_ALL_SPACES = 1 << 0
@@ -50,12 +58,15 @@ class Overlay:
         font_size: float = 46.0,
         gap: float = 6.0,
         text_color: str = "#FFFFFF",
+        lang: str = langs.DEFAULT_TARGET,
     ):
         self.region = region
         self.position = position
         self.font_size = font_size
         self.gap = gap
         self.text_color = _nscolor(text_color)
+        self.lang = lang
+        self._rtl = langs.is_rtl(lang)
         self._last_text = None
         self._anchor = None  # smoothed anchor rect (CG coords)
 
@@ -95,11 +106,16 @@ class Overlay:
             pass
         w.contentView().addSubview_(lbl)
 
-        base = (
-            AppKit.NSFont.fontWithName_size_("SF Arabic", font_size)
-            or AppKit.NSFont.fontWithName_size_("Geeza Pro", font_size)
-            or AppKit.NSFont.boldSystemFontOfSize_(font_size)
-        )
+        if langs.script(lang) == "Arab":
+            base = (
+                AppKit.NSFont.fontWithName_size_("SF Arabic", font_size)
+                or AppKit.NSFont.fontWithName_size_("Geeza Pro", font_size)
+                or AppKit.NSFont.boldSystemFontOfSize_(font_size)
+            )
+        else:
+            # the system font's fallback cascade covers every other
+            # script (Latin, Cyrillic, CJK, Indic, Hebrew, ...)
+            base = AppKit.NSFont.boldSystemFontOfSize_(font_size)
         fm = AppKit.NSFontManager.sharedFontManager()
         self.font = fm.convertFont_toHaveTrait_(base, AppKit.NSBoldFontMask) or base
         self._visible = False
@@ -107,7 +123,9 @@ class Overlay:
     def _attributed(self, text: str):
         style = AppKit.NSMutableParagraphStyle.alloc().init()
         style.setAlignment_(AppKit.NSTextAlignmentCenter)
-        style.setBaseWritingDirection_(AppKit.NSWritingDirectionRightToLeft)
+        style.setBaseWritingDirection_(
+            AppKit.NSWritingDirectionRightToLeft if self._rtl
+            else AppKit.NSWritingDirectionLeftToRight)
         shadow = AppKit.NSShadow.alloc().init()
         shadow.setShadowColor_(
             AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.9)
@@ -147,10 +165,10 @@ class Overlay:
             self.label.setAttributedStringValue_(
                 self._attributed(self._last_text))
 
-    def show_text(self, arabic: str, anchor=None):
-        self._last_text = arabic
+    def show_text(self, text: str, anchor=None):
+        self._last_text = text
         rx, ry, rw, rh = self._smoothed(anchor)
-        astr = self._attributed(arabic)
+        astr = self._attributed(text)
         self.label.setAttributedStringValue_(astr)
 
         max_w = max(min(rw * 1.6, self.region[2]), 320.0)

@@ -1,14 +1,17 @@
-"""darija-subs: live English-subtitle -> Moroccan Arabic overlay.
+"""darija-subs: live English-subtitle -> translated overlay (200+ languages).
 
 Pipeline (all local, no network at runtime):
   screen region capture (Quartz) -> Apple Vision OCR (English)
-  -> NLLB int8 via CTranslate2 (eng_Latn -> ary_Arab) with disk cache
+  -> CTranslate2 int8 translation (Terjman for Darija, NLLB-200 for
+     every other language) with a per-language disk cache
   -> click-through AppKit overlay that mirrors the English show/hide.
 
 Usage:
-  run.sh --pick          # first run: drag-select the subtitle area, then it starts
-  run.sh                 # reuse saved region
-  run.sh --headless      # no overlay window; prints/logs events (testing)
+  run.sh --pick            # first run: drag-select the subtitle area, then it starts
+  run.sh                   # reuse saved region + language
+  run.sh --lang Spanish    # translate into another language (name or NLLB code)
+  run.sh --list-langs      # print all 202 supported languages
+  run.sh --headless        # no overlay window; prints/logs events (testing)
 """
 
 import argparse
@@ -20,11 +23,12 @@ import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
-DEFAULT_MODEL = os.path.join(PROJECT_ROOT, "models", "terjman-nano-int8")
-DEFAULT_CACHE = os.path.join(PROJECT_ROOT, "cache.json")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+CACHE_DIR = os.path.join(PROJECT_ROOT, "cache")
+LEGACY_CACHE = os.path.join(PROJECT_ROOT, "cache.json")
 
-from . import capture, ocr, subfilter, textnorm
-from .translate import Translator
+from . import capture, langs, ocr, subfilter, textnorm
+from .translate import Translator, migrate_legacy_cache
 
 
 def load_config() -> dict:
@@ -77,10 +81,10 @@ class Pipeline(threading.Thread):
         self.translator = translator   # preloaded model (GUI reuses it)
         self.stop_flag = threading.Event()
 
-    def _show(self, arabic: str, anchor=None):
+    def _show(self, translated: str, anchor=None):
         if self.overlay is not None:
             from PyObjCTools import AppHelper
-            AppHelper.callAfter(self.overlay.show_text, arabic, anchor)
+            AppHelper.callAfter(self.overlay.show_text, translated, anchor)
 
     def _hide(self):
         if self.overlay is not None:
@@ -94,14 +98,16 @@ class Pipeline(threading.Thread):
             try:
                 translator = Translator(
                     a.model,
+                    target_lang=a.lang,
                     beam_size=a.beam,
-                    cache_path=None if a.no_cache else DEFAULT_CACHE,
+                    cache_dir=None if a.no_cache else CACHE_DIR,
                 )
                 translator.warmup()
             except Exception as e:
                 self.log.emit("fatal", error=f"translator load failed: {e}")
                 os._exit(2)
-        self.log.emit("ready", model=a.model, region=list(self.region))
+        self.log.emit("ready", model=a.model, lang=translator.target_lang,
+                      region=list(self.region))
 
         committed = None
         empty_streak = 0
@@ -152,15 +158,15 @@ class Pipeline(threading.Thread):
                 empty_streak = 0
                 if text != committed:
                     t2 = time.perf_counter()
-                    arabic = translator.translate(text)
+                    translated = translator.translate(text)
                     tr_ms = (time.perf_counter() - t2) * 1000
                     committed = text
-                    if arabic:
-                        self._show(arabic, anchor)
+                    if translated:
+                        self._show(translated, anchor)
                         self.log.emit(
                             "show",
                             en=text,
-                            ar=arabic,
+                            ar=translated,   # key kept for log/tool compat
                             ocr_ms=round(ocr_ms, 1),
                             tr_ms=round(tr_ms, 1),
                         )
@@ -181,9 +187,17 @@ def parse_args(argv):
                         "scan starts (default 0.5 = lower half)")
     p.add_argument("--region", type=str, help="x,y,w,h in global screen points (top-left origin)")
     p.add_argument("--position", choices=["above", "below", "cover"], default=None,
-                   help="where the Arabic goes relative to the English (cover = hide the English)")
+                   help="where the translation goes relative to the English "
+                        "(cover = hide the English)")
     p.add_argument("--font-size", type=float, default=None)
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--lang", default=None,
+                   help="target language: NLLB code (spa_Latn) or a name "
+                        "('Spanish', 'Darija'). Default: last used, else Darija")
+    p.add_argument("--list-langs", action="store_true",
+                   help="print the 202 supported languages and exit")
+    p.add_argument("--model", default=None,
+                   help="override the model dir (default: auto-chosen "
+                        "per language — Terjman for Darija, NLLB otherwise)")
     p.add_argument("--beam", type=int, default=2,
                    help="beam size (2 = best quality/speed tradeoff, measured)")
     p.add_argument("--interval", type=int, default=50, help="poll interval ms")
@@ -201,9 +215,51 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
+def resolve_language(args, cfg) -> str | None:
+    """--lang (name or code) > saved config > Darija. None = bad input."""
+    if args.lang:
+        code = langs.resolve(args.lang)
+        if code is None:
+            print(f"ERROR: unknown language {args.lang!r}. "
+                  f"Try --list-langs.", file=sys.stderr)
+        return code
+    saved = cfg.get("target_lang", langs.DEFAULT_TARGET)
+    return saved if saved in langs.LANGS else langs.DEFAULT_TARGET
+
+
+def finalize_args(args, cfg) -> int:
+    """Resolve language + model and migrate the legacy cache. Shared by
+    the CLI and the GUI so both agree on routing. Returns 0 or an error
+    exit code."""
+    code = resolve_language(args, cfg)
+    if code is None:
+        return 2
+    args.lang = code
+    if args.model is None:
+        args.model = langs.pick_model(code, MODELS_DIR)
+    if not os.path.isdir(args.model):
+        print(
+            f"ERROR: translation model not found at {args.model}\n"
+            f"Run: tools/setup_model.sh",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.no_cache:
+        migrate_legacy_cache(
+            LEGACY_CACHE, CACHE_DIR,
+            os.path.join(MODELS_DIR, langs.SPECIALIST_MODELS["ary_Arab"]),
+        )
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = load_config()
+
+    if args.list_langs:
+        for code in sorted(langs.LANGS, key=lambda c: langs.LANGS[c][0]):
+            print(f"{code:10s}  {langs.label(code)}")
+        return 0
 
     if args.turbo:
         if args.interval == 50:
@@ -216,13 +272,9 @@ def main(argv=None):
     if args.font_size is None:
         args.font_size = cfg.get("font_size", 46.0)
 
-    if not os.path.isdir(args.model):
-        print(
-            f"ERROR: translation model not found at {args.model}\n"
-            f"Run: tools/setup_model.sh",
-            file=sys.stderr,
-        )
-        return 2
+    rc = finalize_args(args, cfg)
+    if rc:
+        return rc
 
     if not capture.has_screen_permission():
         capture.request_screen_permission()
@@ -269,9 +321,11 @@ def main(argv=None):
         cfg["region"] = list(reg)
         cfg["position"] = args.position
         cfg["font_size"] = args.font_size
+        cfg["target_lang"] = args.lang
         save_config(cfg)
         state["overlay"] = Overlay(
-            reg, position=args.position, font_size=args.font_size
+            reg, position=args.position, font_size=args.font_size,
+            lang=args.lang,
         )
         state["pipe"] = Pipeline(reg, args, log, overlay=state["overlay"])
         state["pipe"].start()

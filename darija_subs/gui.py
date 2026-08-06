@@ -1,8 +1,10 @@
 """Subtitle Translator — desktop control panel (native AppKit).
 
-One big On/Off control, the subtitle text size, and a colour wheel with
-a hex bar. The translation model loads once at launch and is reused, so
-toggling On is instant.
+One big On/Off control, a searchable target-language picker (202
+languages), the subtitle text size, and a colour wheel with a hex bar.
+The translation model loads once at launch and is reused, so toggling
+On is instant. Changing language reuses the already-loaded NLLB model
+via retarget() — only crossing the Terjman/NLLB boundary loads weights.
 
 The panel sets NSWindowSharingNone on itself, exactly like the overlay,
 so the OCR can never read the panel's own text as if it were subtitles.
@@ -12,7 +14,6 @@ Run:  ./gui.sh          (or: .venv/bin/python -m darija_subs.gui)
 
 import colorsys
 import math
-import os
 import sys
 import threading
 import time
@@ -24,12 +25,13 @@ import objc
 import Quartz
 from PyObjCTools import AppHelper
 
-from .main import (DEFAULT_CACHE, EventLog, Pipeline, load_config, parse_args,
-                   save_config)
+from . import langs
+from .main import (CACHE_DIR, MODELS_DIR, EventLog, Pipeline, finalize_args,
+                   load_config, parse_args, save_config)
 from .overlay import Overlay
 from .translate import Translator
 
-W, H = 460, 566
+W, H = 460, 622
 CARD_X, CARD_W = 24, 412
 WHEEL = 168
 
@@ -242,20 +244,22 @@ class AccentButton(AppKit.NSButton):
 # ---------------------------------------------------------------- panel
 class Controller(AppKit.NSObject):
 
-    def initWithArgs_(self, args):
+    def initWithArgs_cfg_(self, args, cfg):
         self = objc.super(Controller, self).init()
         if self is None:
             return None
         self.args = args
-        self.cfg = load_config()
+        self.cfg = cfg
+        self.lang = args.lang
         self.translator = None
+        self.translators = {}      # model_dir -> Translator (kept loaded)
         self.pipe = None
         self.overlay = None
         self.count = 0
         self.state = "loading"
         self.color_hex = self.cfg.get("text_color", "#FFFFFF")
         self._build_ui()
-        self._load_model_async()
+        self._load_model_async(restart=False)
         return self
 
     # ---------- ui ----------------------------------------------
@@ -286,16 +290,17 @@ class Controller(AppKit.NSObject):
         faint = _color((1, 1, 1), 0.38)
 
         root.addSubview_(_label("Subtitle Translator", 26,
-                                Foundation.NSMakeRect(0, 500, W, 34),
+                                Foundation.NSMakeRect(0, 556, W, 34),
                                 bold=True,
                                 align=AppKit.NSTextAlignmentCenter))
-        root.addSubview_(_label("English  →  Moroccan Darija", 13,
-                                Foundation.NSMakeRect(0, 478, W, 20),
-                                color=secondary,
-                                align=AppKit.NSTextAlignmentCenter))
+        self.pair_label = _label(
+            f"English  →  {langs.english_name(self.lang)}", 13,
+            Foundation.NSMakeRect(0, 534, W, 20),
+            color=secondary, align=AppKit.NSTextAlignmentCenter)
+        root.addSubview_(self.pair_label)
         root.addSubview_(_label(
             "Runs entirely on this Mac · nothing is uploaded", 11,
-            Foundation.NSMakeRect(0, 459, W, 16),
+            Foundation.NSMakeRect(0, 515, W, 16),
             color=faint, align=AppKit.NSTextAlignmentCenter))
 
         # status pill
@@ -312,23 +317,42 @@ class Controller(AppKit.NSObject):
         holder.addSubview_(dot)
         holder.addSubview_(self.status)
         pill = AppKit.NSView.alloc().initWithFrame_(
-            Foundation.NSMakeRect(0, 418, W, 20))
+            Foundation.NSMakeRect(0, 474, W, 20))
         pill.addSubview_(holder)
         self._pill_holder = holder
         root.addSubview_(pill)
 
         # main button
         btn = AccentButton.alloc().initWithFrame_(
-            Foundation.NSMakeRect((W - 220) / 2, 348, 220, 56))
+            Foundation.NSMakeRect((W - 220) / 2, 404, 220, 56))
         btn.setTarget_(self)
         btn.setAction_(objc.selector(self.toggle_, signature=b"v@:@"))
         btn.configure("Loading…", ACCENT_BUSY, enabled=False)
         self.button = btn
         root.addSubview_(btn)
 
-        self.hint = _label("", 11, Foundation.NSMakeRect(0, 326, W, 16),
+        self.hint = _label("", 11, Foundation.NSMakeRect(0, 382, W, 16),
                            color=faint, align=AppKit.NSTextAlignmentCenter)
         root.addSubview_(self.hint)
+
+        # ---- language card (type to search all 202 languages)
+        lc = _card(Foundation.NSMakeRect(CARD_X, 320, CARD_W, 54))
+        lc.addSubview_(_label("Language", 12,
+                              Foundation.NSMakeRect(16, 17, 90, 18),
+                              color=secondary))
+        combo = AppKit.NSComboBox.alloc().initWithFrame_(
+            Foundation.NSMakeRect(108, 13, CARD_W - 124, 27))
+        combo.setUsesDataSource_(False)
+        combo.addItemsWithObjectValues_(langs.all_labels())
+        combo.setCompletes_(True)          # type-ahead search
+        combo.setNumberOfVisibleItems_(14)
+        combo.setStringValue_(langs.label(self.lang))
+        combo.setFont_(AppKit.NSFont.systemFontOfSize_(12))
+        combo.setTarget_(self)
+        combo.setAction_(objc.selector(self.langChanged_, signature=b"v@:@"))
+        self.lang_combo = combo
+        lc.addSubview_(combo)
+        root.addSubview_(lc)
 
         # ---- style card
         s = _card(Foundation.NSMakeRect(CARD_X, 26, CARD_W, 286))
@@ -443,27 +467,71 @@ class Controller(AppKit.NSObject):
         self.cfg["font_size"] = v
         save_config(self.cfg)
 
+    # ---------- language -----------------------------------------
+    def langChanged_(self, sender):
+        code = langs.resolve(str(sender.stringValue()))
+        if code is None:
+            sender.setStringValue_(langs.label(self.lang))  # reject input
+            return
+        sender.setStringValue_(langs.label(code))
+        if code == self.lang or self.state == "loading":
+            return
+        self.lang = code
+        self.args.lang = code
+        self.cfg["target_lang"] = code
+        save_config(self.cfg)
+        self.pair_label.setStringValue_(
+            f"English  →  {langs.english_name(code)}")
+        was_on = self.state == "on"
+        if was_on:
+            self._stop()
+        self.state = "loading"
+        self.button.configure("Loading…", ACCENT_BUSY, enabled=False)
+        self._set_status("Loading model…", ACCENT_BUSY)
+        self._load_model_async(restart=was_on)
+
     # ---------- model --------------------------------------------
     @objc.python_method
-    def _load_model_async(self):
+    def _model_dir(self) -> str:
+        # an explicit --model always wins; otherwise route per language
+        if getattr(self.args, "model_explicit", False):
+            return self.args.model
+        return langs.pick_model(self.lang, MODELS_DIR)
+
+    @objc.python_method
+    def _load_model_async(self, restart: bool):
+        """Load (or retarget) the model for self.lang off the main thread.
+        NLLB is one shared instance across all its languages, so switching
+        between two NLLB languages is a cache-file swap, not a 600 MB load."""
+        lang, model_dir = self.lang, self._model_dir()
+
         def work():
             try:
-                tr = Translator(
-                    self.args.model,
-                    beam_size=self.args.beam,
-                    cache_path=None if self.args.no_cache else DEFAULT_CACHE,
-                )
-                tr.warmup()
+                tr = self.translators.get(model_dir)
+                if tr is None:
+                    tr = Translator(
+                        model_dir,
+                        target_lang=lang,
+                        beam_size=self.args.beam,
+                        cache_dir=None if self.args.no_cache else CACHE_DIR,
+                    )
+                    tr.warmup()
+                else:
+                    tr.retarget(lang)
             except Exception as e:
                 AppHelper.callAfter(self._model_failed, str(e))
                 return
-            AppHelper.callAfter(self._model_ready, tr)
+            AppHelper.callAfter(self._model_ready, model_dir, tr, restart)
         threading.Thread(target=work, daemon=True).start()
 
     @objc.python_method
-    def _model_ready(self, tr):
+    def _model_ready(self, model_dir, tr, restart: bool):
+        self.translators[model_dir] = tr
         self.translator = tr
+        self.args.model = model_dir
         self._set_state("off")
+        if restart:
+            self._start()
 
     @objc.python_method
     def _model_failed(self, err):
@@ -515,7 +583,8 @@ class Controller(AppKit.NSObject):
 
         self.overlay = Overlay(region, position="above",
                                font_size=a.font_size,
-                               text_color=self.color_hex)
+                               text_color=self.color_hex,
+                               lang=self.lang)
         log = EventLog(a.log, echo=False, listener=self._on_event)
         self.pipe = Pipeline(region, a, log, overlay=self.overlay,
                              translator=self.translator)
@@ -575,17 +644,19 @@ def main(argv=None):
         argv.remove("--start-on")
 
     args = parse_args(argv)
-    if not os.path.isdir(args.model):
-        print(f"ERROR: model not found at {args.model}", file=sys.stderr)
-        return 2
+    cfg = load_config()
+    args.model_explicit = args.model is not None
+    rc = finalize_args(args, cfg)
+    if rc:
+        return rc
 
     app = AppKit.NSApplication.sharedApplication()
     # MUST be Accessory: under Regular policy macOS refuses to draw the
-    # borderless overlay window, so no Arabic ever reaches the screen even
+    # borderless overlay window, so no subtitle ever reaches the screen even
     # though capture/OCR/translation all succeed. Verified by A/B test.
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     _install_menu()
-    ctl = Controller.alloc().initWithArgs_(args)
+    ctl = Controller.alloc().initWithArgs_cfg_(args, cfg)
     app.activateIgnoringOtherApps_(True)
 
     if start_on:
@@ -690,6 +761,52 @@ def _self_test(ctl):
         print(f"restart ok in {time.time()-t1:.1f}s (model reused)", flush=True)
     AppHelper.callAfter(ctl.toggle_, None)
     time.sleep(1)
+
+    # -- language switch: Darija -> Spanish (NLLB load) -> back ------
+    def switch_to(text, want_code, timeout):
+        def do():
+            ctl.lang_combo.setStringValue_(text)
+            ctl.langChanged_(ctl.lang_combo)
+        AppHelper.callAfter(do)
+        t = time.time()
+        while time.time() - t < timeout:
+            if (ctl.state == "off" and ctl.lang == want_code
+                    and ctl.translator is not None
+                    and ctl.translator.target_lang == want_code):
+                return time.time() - t
+            time.sleep(0.3)
+        return None
+
+    dt = switch_to("Spanish", "spa_Latn", 180)
+    if dt is None:
+        print("FAIL: switch to Spanish never became ready", flush=True)
+        ok = False
+    else:
+        head = str(ctl.pair_label.stringValue())
+        sample = ctl.translator.translate("Good morning, my friend.")
+        latin = all(ord(c) < 0x370 for c in sample)
+        if "Spanish" not in head or not sample or not latin:
+            print(f"FAIL: Spanish switch (head={head!r}, sample={sample!r})",
+                  flush=True)
+            ok = False
+        else:
+            print(f"lang ok — Spanish loaded in {dt:.1f}s, {sample!r}",
+                  flush=True)
+
+    dt = switch_to("Darija", "ary_Arab", 60)
+    if dt is None:
+        print("FAIL: switch back to Darija never became ready", flush=True)
+        ok = False
+    else:
+        sample = ctl.translator.translate("Good morning, my friend.")
+        arabic = any("؀" <= c <= "ۿ" for c in sample)
+        if not arabic or "terjman" not in ctl.translator.model_dir:
+            print(f"FAIL: Darija switch (model={ctl.translator.model_dir}, "
+                  f"sample={sample!r})", flush=True)
+            ok = False
+        else:
+            print(f"lang ok — back to Darija (terjman) in {dt:.1f}s, "
+                  f"{sample!r}", flush=True)
 
     print("PASS" if ok else "FAIL", flush=True)
     AppHelper.callAfter(AppKit.NSApp.terminate_, None)
