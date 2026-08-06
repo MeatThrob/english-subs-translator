@@ -29,6 +29,28 @@ from . import langs
 _DIACRITICS = re.compile("[ً-ْٰ]")
 
 
+def _quiet_tokenizer_noise():
+    """Silence two known-noisy, non-actionable tokenizer-load warnings.
+
+    Suppression only — behaviour must not change:
+      - transformers' "incorrect regex pattern / fix_mistral_regex" note
+        targets Mistral tokenizers, not NLLB; setting the flag could
+        alter tokenization, so we hide the message instead.
+      - Marian's "pip install sacremoses" hint: installing it would
+        change Marian detokenization, which the Darija golden test pins.
+    """
+    import logging
+    import warnings
+
+    warnings.filterwarnings("ignore", message=r".*sacremoses.*")
+
+    class _Drop(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "incorrect regex pattern" not in record.getMessage()
+
+    logging.getLogger("transformers").addFilter(_Drop())
+
+
 def cache_path_for(cache_dir: str, model_dir: str, target_lang: str) -> str:
     """One cache file per (model, target) — the shard IS the cache key."""
     return os.path.join(
@@ -63,6 +85,7 @@ class Translator:
         intra_threads: int = 2,
         cache_dir: str | None = None,
     ):
+        _quiet_tokenizer_noise()
         from transformers import AutoTokenizer  # deferred: slow import
 
         self.model_dir = model_dir

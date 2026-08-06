@@ -276,6 +276,9 @@ class Controller(AppKit.NSObject):
         win.setTitlebarAppearsTransparent_(True)
         win.setTitleVisibility_(1)  # NSWindowTitleVisibilityHidden
         win.setMovableByWindowBackground_(True)
+        # Keep the panel out of screen capture so the OCR can never read
+        # the panel's own text as subtitles (same guarantee as the overlay).
+        win.setSharingType_(AppKit.NSWindowSharingNone)
         win.setDelegate_(self)
         self.window = win
 
@@ -343,7 +346,7 @@ class Controller(AppKit.NSObject):
         combo = AppKit.NSComboBox.alloc().initWithFrame_(
             Foundation.NSMakeRect(108, 13, CARD_W - 124, 27))
         combo.setUsesDataSource_(False)
-        combo.addItemsWithObjectValues_(langs.all_labels())
+        combo.addItemsWithObjectValues_(self._combo_items())
         combo.setCompletes_(True)          # type-ahead search
         combo.setNumberOfVisibleItems_(14)
         combo.setStringValue_(langs.label(self.lang))
@@ -468,6 +471,19 @@ class Controller(AppKit.NSObject):
         save_config(self.cfg)
 
     # ---------- language -----------------------------------------
+    @objc.python_method
+    def _combo_items(self) -> list:
+        """Recently-used languages first (current one on top), then the
+        full alphabetical list — so switching back to a usual language
+        is one dropdown click, not a 202-entry scroll."""
+        recents = [c for c in ([self.lang] + self.cfg.get("recent_langs", []))
+                   if c in langs.LANGS]
+        seen: list[str] = []
+        for c in recents:
+            if c not in seen:
+                seen.append(c)
+        return [langs.label(c) for c in seen[:5]] + langs.all_labels()
+
     def langChanged_(self, sender):
         code = langs.resolve(str(sender.stringValue()))
         if code is None:
@@ -479,7 +495,13 @@ class Controller(AppKit.NSObject):
         self.lang = code
         self.args.lang = code
         self.cfg["target_lang"] = code
+        rec = [code] + [c for c in self.cfg.get("recent_langs", [])
+                        if c != code]
+        self.cfg["recent_langs"] = rec[:5]
         save_config(self.cfg)
+        sender.removeAllItems()
+        sender.addItemsWithObjectValues_(self._combo_items())
+        sender.setStringValue_(langs.label(code))
         self.pair_label.setStringValue_(
             f"English  →  {langs.english_name(code)}")
         was_on = self.state == "on"
@@ -762,51 +784,79 @@ def _self_test(ctl):
     AppHelper.callAfter(ctl.toggle_, None)
     time.sleep(1)
 
-    # -- language switch: Darija -> Spanish (NLLB load) -> back ------
-    def switch_to(text, want_code, timeout):
+    # -- language switching, driven like a user: type a partial name
+    # into the combo and confirm (2 gestures: type + Enter) ----------
+    def switch_to(typed, want_code, want_state, timeout):
         def do():
-            ctl.lang_combo.setStringValue_(text)
+            ctl.lang_combo.setStringValue_(typed)
             ctl.langChanged_(ctl.lang_combo)
         AppHelper.callAfter(do)
         t = time.time()
         while time.time() - t < timeout:
-            if (ctl.state == "off" and ctl.lang == want_code
+            if (ctl.state == want_state and ctl.lang == want_code
                     and ctl.translator is not None
-                    and ctl.translator.target_lang == want_code):
+                    and ctl.translator.target_lang == want_code
+                    and (want_state == "off"
+                         or (ctl.pipe is not None and ctl.pipe.is_alive()))):
                 return time.time() - t
             time.sleep(0.3)
         return None
 
-    dt = switch_to("Spanish", "spa_Latn", 180)
-    if dt is None:
-        print("FAIL: switch to Spanish never became ready", flush=True)
-        ok = False
-    else:
-        head = str(ctl.pair_label.stringValue())
-        sample = ctl.translator.translate("Good morning, my friend.")
-        latin = all(ord(c) < 0x370 for c in sample)
-        if "Spanish" not in head or not sample or not latin:
-            print(f"FAIL: Spanish switch (head={head!r}, sample={sample!r})",
-                  flush=True)
-            ok = False
-        else:
-            print(f"lang ok — Spanish loaded in {dt:.1f}s, {sample!r}",
-                  flush=True)
+    from .main import load_config as _reload_cfg
 
-    dt = switch_to("Darija", "ary_Arab", 60)
-    if dt is None:
-        print("FAIL: switch back to Darija never became ready", flush=True)
+    def lang_check(typed, want_code, want_state, timeout, expect):
+        dt = switch_to(typed, want_code, want_state, timeout)
+        if dt is None:
+            print(f"FAIL: typing {typed!r} never reached "
+                  f"{want_code}/{want_state}", flush=True)
+            return False
+        combo_now = str(ctl.lang_combo.stringValue())
+        saved = _reload_cfg().get("target_lang")
+        sample = ctl.translator.translate("Good morning, my friend.")
+        if combo_now != langs.label(want_code):
+            print(f"FAIL: combo shows {combo_now!r} after {typed!r}", flush=True)
+            return False
+        if saved != want_code:
+            print(f"FAIL: config target_lang={saved!r}, want {want_code}", flush=True)
+            return False
+        if not expect(sample):
+            print(f"FAIL: sample for {want_code}: {sample!r}", flush=True)
+            return False
+        print(f"lang ok — typed {typed!r} -> {langs.english_name(want_code)} "
+              f"({want_state}, {dt:.1f}s) {sample!r}", flush=True)
+        return True
+
+    latin = lambda s: bool(s) and all(ord(c) < 0x370 for c in s)
+    arab = lambda s: any("؀" <= c <= "ۿ" for c in s)
+    cyr = lambda s: any("Ѐ" <= c <= "ӿ" for c in s)
+
+    # off-state: partial English name loads NLLB
+    ok &= lang_check("spa", "spa_Latn", "off", 180, latin)
+    # informal name routes back to the terjman specialist
+    ok &= lang_check("darija", "ary_Arab", "off", 60, arab)
+
+    # realistic case: switching while the overlay is running mid-show —
+    # must auto-stop, swap model, and auto-restart without help
+    AppHelper.callAfter(ctl.toggle_, None)
+    time.sleep(2)
+    if ctl.state != "on":
+        print("FAIL: could not turn on before live-switch test", flush=True)
+        ok = False
+    ok &= lang_check("esp", "spa_Latn", "on", 120, latin)      # native, partial
+    ok &= lang_check("русский", "rus_Cyrl", "on", 60, cyr)     # native spelling
+    ok &= lang_check("DARIJA", "ary_Arab", "on", 60, arab)     # case-insensitive
+
+    # recents surface at the top of the dropdown, current first
+    top3 = [str(ctl.lang_combo.itemObjectValueAtIndex_(i)) for i in range(3)]
+    want_top = [langs.label(c) for c in ("ary_Arab", "rus_Cyrl", "spa_Latn")]
+    if top3 != want_top:
+        print(f"FAIL: recents order {top3} != {want_top}", flush=True)
         ok = False
     else:
-        sample = ctl.translator.translate("Good morning, my friend.")
-        arabic = any("؀" <= c <= "ۿ" for c in sample)
-        if not arabic or "terjman" not in ctl.translator.model_dir:
-            print(f"FAIL: Darija switch (model={ctl.translator.model_dir}, "
-                  f"sample={sample!r})", flush=True)
-            ok = False
-        else:
-            print(f"lang ok — back to Darija (terjman) in {dt:.1f}s, "
-                  f"{sample!r}", flush=True)
+        print(f"recents ok — dropdown starts {top3}", flush=True)
+
+    AppHelper.callAfter(ctl.toggle_, None)
+    time.sleep(1)
 
     print("PASS" if ok else "FAIL", flush=True)
     AppHelper.callAfter(AppKit.NSApp.terminate_, None)

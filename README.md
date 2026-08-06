@@ -46,7 +46,10 @@ Swahili, and 170+ more, each labelled with its native name in the picker.
    Direction and font follow the target script: RTL + SF Arabic for
    Arabic-script targets, RTL for Hebrew, the system font cascade for
    Latin/Cyrillic/CJK/Indic. Excluded from screen capture
-   (`NSWindowSharingNone`), so the OCR can never read its own output.
+   (`NSWindowSharingNone`), so the OCR can never read its own output —
+   re-verified 2026-08: without the exclusion, cover mode feeds back at
+   ~13 show/hide flaps per line; with it, exactly one show per line.
+   The e2e test now fails on any such flap storm.
 
 Measured on an M2 (busy machine, load ~9; idle numbers are better),
 warm per-line translation latency on real subtitle lines, beam 2:
@@ -74,9 +77,12 @@ show avg ~735 ms.
 ~/Developer/darija-subs/gui.sh
 ```
 
-Type in the Language box to search all 202 (e.g. "japa…" → Japanese —
-日本語). The choice is saved and reused; switching while running
-restarts the overlay in the new language automatically.
+Type in the Language box to search all 202 — partial, case-insensitive,
+English or native spelling all work ("spa", "esp", "русский", "DARIJA").
+Recently-used languages sit at the top of the dropdown, current first.
+The choice is saved and reused; switching while running restarts the
+overlay in the new language automatically (~0.3 s between already-loaded
+models).
 
 **CLI:**
 
@@ -144,8 +150,14 @@ automatically on first run.
 ```bash
 .venv/bin/python tests/bench_ocr.py           # OCR accuracy/latency on synthetic frames
 .venv/bin/python tests/test_multilang_unit.py # cache sharding, retarget, cleanup, migration
+.venv/bin/python tests/regress_darija.py      # Darija golden outputs (46 lines, char-exact)
 .venv/bin/python tests/bench_translate.py     # per-language latency table (above)
 .venv/bin/python tests/e2e_test.py            # full pipeline vs. a fake subtitle player
 E2E_EXTRA="--lang Spanish" .venv/bin/python tests/e2e_test.py   # e2e in another language
 .venv/bin/python -m darija_subs.gui --self-test  # control panel incl. language switching
 ```
+
+`tests/e2e_test.py` restores your real `config.json` afterwards and
+fails on spurious show/hide storms (the overlay-feedback signature).
+`tests/regress_darija.py` pins Darija output to the pre-multilingual
+baseline; run it after touching anything in the translation path.

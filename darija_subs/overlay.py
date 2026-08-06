@@ -81,6 +81,11 @@ class Overlay:
         w.setOpaque_(False)
         w.setHasShadow_(False)
         w.setIgnoresMouseEvents_(True)
+        # Load-bearing: without this the capture loop sees our own text
+        # and cover mode feeds back (OCR reads the overlay, hides, reads
+        # the English, shows again — measured ~13 flaps/line). ReadOnly
+        # is the NSWindow default, so this must be explicit.
+        w.setSharingType_(AppKit.NSWindowSharingNone)
         w.setLevel_(AppKit.NSScreenSaverWindowLevel)
         w.setCollectionBehavior_(
             _CAN_JOIN_ALL_SPACES | _STATIONARY | _FULLSCREEN_AUX

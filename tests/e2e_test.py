@@ -46,7 +46,27 @@ def norm(s):
     return normalize(s).lower().rstrip(".!?").strip()
 
 
+CONFIG_PATH = os.path.join(ROOT, "config.json")
+
+
 def main():
+    """Run the e2e but never leave the user's real config.json altered —
+    the app under test saves the fake-player rect into it."""
+    cfg0 = None
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "rb") as f:
+            cfg0 = f.read()
+    try:
+        return _run()
+    finally:
+        if cfg0 is not None:
+            with open(CONFIG_PATH, "wb") as f:
+                f.write(cfg0)
+        elif os.path.exists(CONFIG_PATH):
+            os.remove(CONFIG_PATH)
+
+
+def _run():
     for p in (PLAYER_LOG, APP_LOG, TRIGGER):
         if os.path.exists(p):
             os.remove(p)
@@ -140,6 +160,21 @@ def main():
         else:
             used.add(id(m))
             lat_hide.append(m["t"] - e["t"])
+
+    # Spurious-event guard: matching only proves the expected events
+    # happened; a feedback loop (overlay visible to capture) shows up as
+    # a storm of EXTRA show/hide flaps that the matcher would ignore.
+    # Measured failure mode before the NSWindowSharingNone fix: ~105 app
+    # shows for 8 player lines in cover mode. Small surplus is allowed
+    # for partial-line OCR refinements.
+    extra_shows = len(app_shows) - len(lat_show)
+    extra_hides = len(app_hides) - len(lat_hide)
+    limit = max(2, len(shows) // 2)
+    if extra_shows > limit or extra_hides > limit:
+        print(f"  SPURIOUS: {extra_shows} unmatched app shows / "
+              f"{extra_hides} unmatched hides (limit {limit}) — "
+              f"overlay feedback or flapping")
+        ok = False
 
     if lat_show:
         print(f"show latency: avg {sum(lat_show)/len(lat_show)*1000:.0f} ms, "
