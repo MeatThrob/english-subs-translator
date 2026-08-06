@@ -2,10 +2,12 @@
 
 Live English-subtitle → **any of 202 languages** overlay, for
 **macOS and Windows**. macOS is the verified daily driver; the Windows
-port lives in [`windows/`](windows/) and is **experimental — it has
-never been executed on real Windows hardware** (its platform-independent
-core is verified on macOS; see [`windows/README.md`](windows/README.md)
-for exactly what is and is not tested). Linux is not supported.
+build lives in [`windows/`](windows/) at **full feature parity** (same
+shared core, all 202 languages) and is **experimental — it has never
+been executed on real Windows hardware**; its entire Qt/mss stack is
+verified on macOS, and [`windows/FINISHING.md`](windows/FINISHING.md)
+walks the first real-Windows tester through the rest. Linux is not
+supported.
 
 The name is the origin story: it began as a Moroccan Arabic (Darija)
 tool, and Darija is still the default target with its own specialist
@@ -179,18 +181,23 @@ login`) and map its language there.
 
 ## Other platforms
 
-**Windows — experimental, in [`windows/`](windows/).** A Qt/PySide6 port
-(WinRT OCR, `mss` capture, `WDA_EXCLUDEFROMCAPTURE` for
-capture-exclusion). Its platform-independent parts — pipeline, GUI,
-translation — are verified end-to-end on macOS (e2e PASS, GUI self-test
-PASS, Darija output char-identical to this repo's 46-line golden), but
-**it has never been executed on a real Windows machine**: the WinRT OCR
-backend, the capture-exclusion call, the DPI scaling and the `.bat`
-scripts are all unexercised. It is also **Darija-only** — it predates
-the multilingual work and does not yet have the 202-language support
-above. `windows/README.md` states exactly what is unverified and ships
-self-tests so the first Windows user can find out in ~2 minutes;
-results reported in an issue are genuinely welcome.
+**Windows — experimental, in [`windows/`](windows/).** Since v1.2.0
+this is the **same program at full feature parity**, not a port that
+lags behind: one shared `darija_subs` package holds all the logic
+(translation, the 202-language registry and routing, per-language
+caches, subtitle filtering, the capture→OCR→translate→overlay loop),
+and only `darija_subs/platform/{mac,win}/` differ — Quartz/Vision/
+AppKit on macOS vs `mss`/WinRT/Qt on Windows, including a Qt language
+picker with the same search-recents-live-switch behaviour as the
+AppKit one. The whole Windows/Qt stack is verified end-to-end **on
+macOS** (e2e PASS in Darija and Spanish, GUI self-test PASS including
+live language switching, Darija char-identical to the 46-line golden),
+but **it has never been executed on a real Windows machine**: the WinRT
+OCR backend, the capture-exclusion call, the DPI scaling, the Windows
+font names and the `.bat` scripts are all unexercised.
+[`windows/FINISHING.md`](windows/FINISHING.md) is the step-by-step
+handoff for the first person on real Windows — what to run, what a pass
+looks like, what to report; results in an issue are genuinely welcome.
 
 **Linux — not supported yet.** No port exists, and honesty about the
 delta: OCR would be easy (the Windows port's RapidOCR backend is
@@ -245,6 +252,13 @@ automatically on first run.
 E2E_EXTRA="--lang Spanish" .venv/bin/python tests/e2e_test.py   # e2e in another language
 .venv/bin/python -m darija_subs.gui --self-test  # control panel incl. language switching
 ```
+
+The Windows platform stack has its own suite under `windows/tests/`
+(runnable on Windows, and on macOS against a venv with
+PySide6/mss/pillow by forcing `DARIJA_SUBS_PLATFORM=win`) — the Qt
+fake-player e2e, the WinRT downscale guard, the font-cascade/tofu
+check, the capture-exclusion probe, and OCR/translation benches. See
+`windows/FINISHING.md` for the run order and expected outputs.
 
 `tests/e2e_test.py` and the GUI `--self-test` both restore your real
 `config.json` afterwards (they drive handlers that save to it on
