@@ -75,10 +75,19 @@ def main():
         tr.save_cache()
         es_shard = cache_path_for(cache_dir, nllb, "spa_Latn")
         ja_shard = cache_path_for(cache_dir, nllb, "jpn_Jpan")
+        # es_shard != ja_shard is load-bearing: if sharding ever collapses
+        # to one file per model (the pre-multilingual layout), both names
+        # resolve to the SAME path and the mere-existence version of this
+        # check still passes. Same for `es != ja` below — under that
+        # regression the Japanese lookup is a cache hit on the Spanish
+        # line, so the two equality checks pass vacuously.
         check("separate shard files exist",
-              os.path.exists(es_shard) and os.path.exists(ja_shard))
+              es_shard != ja_shard
+              and os.path.exists(es_shard) and os.path.exists(ja_shard),
+              f"es={es_shard} ja={ja_shard}")
         check("shards hold their own language",
-              json.load(open(es_shard))["Thank you very much."] == es
+              es != ja
+              and json.load(open(es_shard))["Thank you very much."] == es
               and json.load(open(ja_shard))["Thank you very much."] == ja)
 
         # retarget back must re-serve the Spanish line from cache
