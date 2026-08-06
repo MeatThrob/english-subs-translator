@@ -14,6 +14,7 @@ Run:  ./gui.sh          (or: .venv/bin/python -m darija_subs.gui)
 
 import colorsys
 import math
+import os
 import sys
 import threading
 import time
@@ -26,8 +27,8 @@ import Quartz
 from PyObjCTools import AppHelper
 
 from . import langs
-from .main import (CACHE_DIR, MODELS_DIR, EventLog, Pipeline, finalize_args,
-                   load_config, parse_args, save_config)
+from .main import (CACHE_DIR, CONFIG_PATH, MODELS_DIR, EventLog, Pipeline,
+                   finalize_args, load_config, parse_args, save_config)
 from .overlay import Overlay
 from .translate import Translator
 
@@ -689,21 +690,55 @@ def main(argv=None):
                 ctl.toggle_(None)
         AppHelper.callLater(0.5, _autostart)
     if self_test:
-        threading.Thread(target=_self_test, args=(ctl,), daemon=True).start()
+        # The self-test drives the real widgets, and those handlers save to
+        # config.json on purpose (colour, language, recents). Snapshot it
+        # now so the run cannot leave the user's settings changed.
+        threading.Thread(target=_self_test, args=(ctl, _config_snapshot()),
+                         daemon=True).start()
 
     AppHelper.runEventLoop(installInterrupt=True)
     return 0
 
 
-def _self_test(ctl):
-    """Drive the panel programmatically and report."""
+def _config_snapshot():
+    """Return a callable that puts config.json back byte-for-byte."""
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            data = f.read()
+    except OSError:
+        data = None
+
+    def restore():
+        if data is None:
+            if os.path.exists(CONFIG_PATH):
+                os.remove(CONFIG_PATH)
+        else:
+            with open(CONFIG_PATH, "wb") as f:
+                f.write(data)
+    return restore
+
+
+def _self_test(ctl, restore=None):
+    """Drive the panel programmatically and report.
+
+    Never leaves the user's real config.json altered: the widget handlers
+    under test save colour/language/recents to it by design.
+    """
+    try:
+        _run_self_test(ctl)
+    finally:
+        if restore is not None:
+            restore()
+        AppHelper.callAfter(AppKit.NSApp.terminate_, None)
+
+
+def _run_self_test(ctl):
     ok = True
     t0 = time.time()
     while ctl.translator is None and time.time() - t0 < 180:
         time.sleep(0.5)
     if ctl.translator is None:
         print("FAIL: model never loaded", flush=True)
-        AppHelper.callAfter(AppKit.NSApp.terminate_, None)
         return
     print(f"model loaded in {time.time()-t0:.1f}s; state={ctl.state}",
           flush=True)
@@ -859,7 +894,7 @@ def _self_test(ctl):
     time.sleep(1)
 
     print("PASS" if ok else "FAIL", flush=True)
-    AppHelper.callAfter(AppKit.NSApp.terminate_, None)
+    # terminate is the caller's job — it must happen after config restore
 
 
 if __name__ == "__main__":
