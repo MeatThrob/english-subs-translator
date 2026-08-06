@@ -1,13 +1,12 @@
 # darija-subs
 
 Live English-subtitle → **any of 202 languages** overlay for macOS.
-Point it at any app or website showing English subs (Crunchyroll, VLC,
-IINA, a browser, anything) — the translation appears in lockstep with
-the English and disappears with it. 100% local: no network at runtime.
-
-Born as a Moroccan Arabic (Darija) tool — hence the name — Darija is
-still the default target and gets its own specialist model. Every other
-language rides the NLLB-200 model.
+The name is the origin story: it began as a Moroccan Arabic (Darija)
+tool, and Darija is still the default target with its own specialist
+model — but it now translates into any NLLB-200 language. Point it at
+any app or website showing English subs (Crunchyroll, VLC, IINA, a
+browser, anything) — the translation appears in lockstep with the
+English and disappears with it. 100% local: no network at runtime.
 
 ## Languages: what is and is not covered
 
@@ -137,6 +136,25 @@ Requirements:
 Routing lives in `darija_subs/langs.py` (`SPECIALIST_MODELS`); drop in
 another specialist (e.g. a gated Terjman-Large after `huggingface-cli
 login`) and map its language there.
+
+## Licensing
+
+**The MIT license in this repo covers the code only — not the model
+weights.** No weights are redistributed here; `tools/setup_model.sh`
+downloads them from Hugging Face onto your machine at setup time, and
+what you may do with them is governed by their own licenses:
+
+- `facebook/nllb-200-distilled-600M` — **CC-BY-NC-4.0
+  (non-commercial)**.
+- `abdeljalilELmajjodi/Terjman-Nano-v2.1` — no license declared on its
+  model card; its parent, `atlasia/Terjman-Nano-v2.0`, is
+  **CC-BY-NC-4.0 (non-commercial)**, so treat this one as
+  non-commercial too.
+
+Practical upshot: as configured, use this tool for **personal /
+non-commercial** purposes. If you need commercial use, swap in models
+whose licenses permit it (the code doesn't care — any CTranslate2
+Marian/NLLB-style model works).
 
 ## Caches
 
