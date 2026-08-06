@@ -73,7 +73,7 @@ show avg ~735 ms.
 **Control panel** (recommended — has the language picker):
 
 ```bash
-~/Developer/darija-subs/gui.sh
+./gui.sh          # from the repo directory
 ```
 
 Type in the Language box to search all 202 — partial, case-insensitive,
@@ -86,14 +86,27 @@ models).
 **CLI:**
 
 ```bash
-~/Developer/darija-subs/run.sh                  # last-used language (Darija by default)
-~/Developer/darija-subs/run.sh --lang Spanish   # by name…
-~/Developer/darija-subs/run.sh --lang jpn_Jpan  # …or NLLB code
-~/Developer/darija-subs/run.sh --list-langs     # the full list
-pkill -f darija_subs.main                       # turn it off
+./run.sh                  # last-used language (Darija by default)
+./run.sh --lang Spanish   # by name…
+./run.sh --lang jpn_Jpan  # …or NLLB code
+./run.sh --list-langs     # the full list
+pkill -f darija_subs.main # turn it off
 ```
 
+`--lang`, `--position`, `--font-size` and the capture region are
+remembered: whatever you pass (or pick) becomes the default for the
+next plain `./run.sh`.
+
 (Ctrl+C also stops it. `./run.sh --pick` hand-selects a region.)
+
+**Which part of the screen is scanned.** A hand-picked box
+(`./run.sh --pick`) is saved to `config.json` and reused by both
+`run.sh` and the control panel until you pick again. Without one, both
+scan the lower half of the main display. An explicit `--region` or
+`--band` overrides the saved box; a saved box that no longer overlaps
+any display (monitor unplugged) is ignored rather than captured blind.
+Snugger is better: fewer pixels to OCR and fewer chances to pick up
+player UI.
 
 Options:
 
@@ -114,15 +127,26 @@ Options:
 Models and the venv are **not** in the repo (≈715 MB, rebuildable):
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install ctranslate2 transformers pyobjc numpy sentencepiece
+git clone https://github.com/MeatThrob/darija-subs.git
+cd darija-subs
+python3 -m venv .venv                     # Python 3.10+ (3.12 and 3.14 tested)
+.venv/bin/pip install ctranslate2 transformers torch pillow \
+                      pyobjc numpy sentencepiece
 tools/setup_model.sh   # downloads + converts both models to int8
 ```
 
+`torch` is needed only at setup time — `ct2-transformers-converter` loads
+the Hugging Face checkpoints through it before quantizing. `pillow` is
+needed only by `tests/bench_ocr.py`. Neither is imported at runtime.
+
 Requirements:
 
+- macOS on Apple Silicon (Vision OCR + AppKit; developed and measured on
+  an M2).
 - Screen Recording permission for your terminal
-  (System Settings → Privacy & Security → Screen Recording).
+  (System Settings → Privacy & Security → Screen Recording). The app
+  checks this at startup and tells you if it is missing. No Accessibility
+  permission is needed — the overlay never reads or synthesizes input.
 - The subtitle region should only contain the subtitles (drag a snug
   box). Text >220 chars is ignored as a safety valve.
 
@@ -158,6 +182,11 @@ Marian/NLLB-style model works).
 
 ## Caches
 
+You do not need to create `config.json` — with no config the app scans
+the lower half of the main display and writes the file itself on first
+run. `config.example.json` just shows the shape and the accepted keys;
+its `region` is one machine's numbers, not a default to copy.
+
 `cache/<model>__<lang>.json` — one shard per (model, language) pair, so
 a language switch can never replay a line from the wrong language. A
 pre-multilingual `cache.json` is migrated into the Darija shard
@@ -175,7 +204,10 @@ E2E_EXTRA="--lang Spanish" .venv/bin/python tests/e2e_test.py   # e2e in another
 .venv/bin/python -m darija_subs.gui --self-test  # control panel incl. language switching
 ```
 
-`tests/e2e_test.py` restores your real `config.json` afterwards and
-fails on spurious show/hide storms (the overlay-feedback signature).
+`tests/e2e_test.py` and the GUI `--self-test` both restore your real
+`config.json` afterwards (they drive handlers that save to it on
+purpose). The e2e also fails on spurious show/hide storms — the
+overlay-feedback signature; removing `NSWindowSharingNone` takes it from
+8 app shows to ~90 for 8 subtitle lines, and the test fails.
 `tests/regress_darija.py` pins Darija output to the pre-multilingual
 baseline; run it after touching anything in the translation path.
